@@ -1,0 +1,11 @@
+site/data.json
+site/src/assets/data.json
+site/node_modules/
+site/dist/
+site/.angular/
+site/src/assets/data.json
+
+# Local AI tooling — not part of the project
+.ccg/
+.claude/
+openspec/

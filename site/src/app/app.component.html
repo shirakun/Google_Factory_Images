@@ -1,0 +1,129 @@
+<header>
+  <div class="header-inner">
+    <h1>Google Firmware Browser</h1>
+    <p class="subtitle">Factory images &amp; OTA updates for Pixel and Nexus devices</p>
+  </div>
+</header>
+
+<main>
+  <input
+    type="search"
+    class="search-input"
+    placeholder="Filter devices…"
+    aria-label="Filter devices"
+    [ngModel]="searchQuery()"
+    (ngModelChange)="searchQuery.set($event)"
+  />
+
+  @if (!data()) {
+    <div class="loading" aria-live="polite">Loading firmware data…</div>
+  }
+
+  @if (data() && sortedDevices().length === 0) {
+    <div class="empty-state">No devices match "<em>{{ searchQuery() }}</em>"</div>
+  }
+
+  @if (data()) {
+    <div class="device-list" role="list">
+      @for (item of sortedDevices(); track item[0]) {
+        <div
+          class="device-card"
+          [id]="'device-' + item[0]"
+          role="listitem"
+        >
+          <button
+            class="device-row"
+            [class.open]="expandedDevice() === item[0]"
+            (click)="toggleDevice(item[0])"
+            [attr.aria-expanded]="expandedDevice() === item[0]"
+            [attr.aria-controls]="'panel-' + item[0]"
+          >
+            <span class="device-name">{{ item[1].name }}</span>
+            <span class="device-meta">
+              <span class="device-codename">{{ item[0] }}</span>
+              <span class="chevron" aria-hidden="true">&#9660;</span>
+            </span>
+          </button>
+
+          @if (expandedDevice() === item[0]) {
+            <div class="accordion-body" [id]="'panel-' + item[0]" role="region">
+              <div class="tab-bar" role="tablist">
+                <button
+                  class="tab-btn"
+                  role="tab"
+                  [class.active]="getTab(item[0]) === 'factory'"
+                  [disabled]="item[1].factory.length === 0"
+                  [attr.aria-selected]="getTab(item[0]) === 'factory'"
+                  (click)="setTab(item[0], 'factory')"
+                >
+                  Factory images
+                  @if (item[1].factory.length > 0) {
+                    <span class="tab-count">{{ item[1].factory.length }}</span>
+                  }
+                </button>
+                <button
+                  class="tab-btn"
+                  role="tab"
+                  [class.active]="getTab(item[0]) === 'ota'"
+                  [disabled]="item[1].ota.length === 0"
+                  [attr.aria-selected]="getTab(item[0]) === 'ota'"
+                  (click)="setTab(item[0], 'ota')"
+                >
+                  OTA updates
+                  @if (item[1].ota.length > 0) {
+                    <span class="tab-count">{{ item[1].ota.length }}</span>
+                  }
+                </button>
+              </div>
+
+              <div role="tabpanel">
+                @if (getEntries(item[0]).length === 0) {
+                  <p class="empty-tab">No {{ getTab(item[0]) === 'factory' ? 'factory images' : 'OTA updates' }} available.</p>
+                }
+                @for (entry of getEntries(item[0]); track entry[0]) {
+                  <div class="version-block">
+                    <div class="version-header">
+                      <span class="version-buildid">{{ entry[0] }}</span>
+                      <button
+                        class="copy-btn"
+                        type="button"
+                        (click)="copyLinks(entry)"
+                      >{{ copyStates.get(entry[0]) ? 'Copied!' : 'Copy all links' }}</button>
+                    </div>
+                    <table class="version-table">
+                      <thead>
+                        <tr><th>File</th><th>Type</th></tr>
+                      </thead>
+                      <tbody>
+                        @if (isSharded(entry)) {
+                          @for (url of getUrls(entry); track url; let i = $index) {
+                            <tr>
+                              <td><a [href]="url" rel="noopener noreferrer">{{ getFilename(url) }}</a></td>
+                              <td>{{ getPartLabel(i, getUrls(entry)) }}</td>
+                            </tr>
+                          }
+                        } @else {
+                          <tr>
+                            <td><a [href]="getUrls(entry)[0]" rel="noopener noreferrer">{{ getFilename(getUrls(entry)[0]) }}</a></td>
+                            <td>Download</td>
+                          </tr>
+                        }
+                      </tbody>
+                    </table>
+                  </div>
+                }
+              </div>
+            </div>
+          }
+        </div>
+      }
+    </div>
+  }
+</main>
+
+<footer>
+  @if (data()) {
+    <p>{{ data()!.counts.devices }} devices &middot; {{ data()!.counts.factory }} factory &middot; {{ data()!.counts.ota }} OTA &middot; Updated {{ data()!.generatedAt | date:'medium' }}</p>
+  }
+  <p>Source: <a href="https://developers.google.com/android/images" rel="noopener">Google developer pages</a></p>
+</footer>

@@ -1,0 +1,90 @@
+name: Build and Deploy Firmware Browser
+
+# One-time setup required:
+#   1. Settings -> Pages -> Source = "Deploy from a branch" -> gh-pages / (root)
+#   2. Add RELEASE_TOKEN secret (PAT with repo scope) so daily URL-list
+#      updates can trigger this workflow. Without it, the automated push
+#      from update-url-lists.yml uses GITHUB_TOKEN and GitHub will not
+#      fire downstream workflows. workflow_dispatch is always available
+#      as a manual fallback.
+#
+# Note: this repo uses allowed_actions=local_only, so all steps are run:.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'FactoryImages.txt'
+      - 'FullOTAImages.txt'
+      - 'site/src/**'
+      - 'site/device-release-dates.json'
+      - 'site/package.json'
+      - 'site/package-lock.json'
+      - 'site/angular.json'
+      - 'site/tsconfig*.json'
+      - '.github/scripts/build-pages-data.mjs'
+      - '.github/scripts/validate-data.mjs'
+      - '.github/workflows/build-pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages-deploy
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        env:
+          CHECKOUT_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+        run: |
+          if [ -n "${{ secrets.RELEASE_TOKEN }}" ]; then
+            echo "::notice::Using RELEASE_TOKEN"
+          else
+            echo "::warning::Using GITHUB_TOKEN -- auto-rebuild via update-url-lists.yml will NOT fire"
+          fi
+          git clone "https://x-access-token:${CHECKOUT_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" .
+
+      - name: Build data.json
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node .github/scripts/build-pages-data.mjs
+
+      - name: Validate data.json
+        run: node .github/scripts/validate-data.mjs
+
+      - name: Install Angular deps
+        run: npm ci --prefix site
+
+      - name: Copy data.json to Angular assets
+        run: cp site/data.json site/src/assets/data.json
+
+      - name: Build Angular app
+        run: cd site && npx ng build --base-href /Google_Factory_Images/
+
+      - name: Assemble dist/
+        run: |
+          mkdir -p dist
+          cp -r site/dist/browser/. dist/
+          touch dist/.nojekyll
+
+      - name: Deploy to gh-pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd dist
+          git init
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "deploy: firmware browser $(date -u +%Y-%m-%dT%H:%M:%SZ) [skip ci]"
+          git push --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            HEAD:gh-pages

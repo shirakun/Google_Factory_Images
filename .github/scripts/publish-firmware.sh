@@ -1,0 +1,1089 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# ─── Constants ───────────────────────────────────────────────────────────────
+readonly SPLIT_THRESHOLD=2147483647        # 2 GiB - 1 byte
+readonly SPLIT_SIZE="1900MiB"
+readonly SOFT_CUTOFF=18000                 # 5h — stop starting new URLs
+readonly HARD_DEADLINE=20400               # 5h40m — abort current ops
+readonly MAX_CONSECUTIVE_FAILURES=5
+readonly MIN_DISK_GIB=9
+readonly DOWNLOAD_MAX_ATTEMPTS=5
+readonly BACKOFF_DELAYS=(0 30 60 120 240 300)
+readonly RATE_LIMIT_CHECK_INTERVAL=20
+readonly RATE_LIMIT_MIN_REMAINING=100
+
+readonly FACTORY_RE='^https://dl\.google\.com/dl/android/aosp/([a-z0-9._]+)-([A-Za-z0-9._]+)-factory-([0-9a-f]{8})\.zip$'
+readonly OTA_RE='^https://dl\.google\.com/dl/android/aosp/([a-z0-9._]+)-ota-([A-Za-z0-9._]+)-([0-9a-f]{8})\.zip$'
+
+# ─── Globals ─────────────────────────────────────────────────────────────────
+START_EPOCH=$(date +%s)
+WORK_DIR=""
+DEVICE_FILTER="${INPUT_DEVICE_FILTER:-}"
+TYPE_FILTER="${INPUT_TYPE_FILTER:-all}"
+DRY_RUN="${INPUT_DRY_RUN:-false}"
+
+# Parsed URL data (parallel arrays)
+declare -a URL_LIST=()
+declare -a DEVICE_LIST=()
+declare -a TYPE_LIST=()
+declare -a FILENAME_LIST=()
+
+# Group index: "device:type" → space-separated indices into URL_LIST
+declare -A GROUP_INDICES=()
+
+# Asset cache: "assetname" → "id size state"
+declare -A ASSET_CACHE=()
+
+# Current release ID (set per group)
+CURRENT_RELEASE_ID=""
+
+# Counters
+TOTAL_TARGETED=0
+TOTAL_SCANNED=0
+TOTAL_SKIPPED=0
+TOTAL_UPLOADED=0
+TOTAL_SPLIT_UPLOADS=0
+TOTAL_FAILED=0
+CONSECUTIVE_FAILURES=0
+BUDGET_STOP=false
+API_CALL_COUNT=0
+
+# Per-device results: "device|type|total|done|skip|fail"
+declare -a DEVICE_RESULTS=()
+
+# Error log for summary
+declare -a ERROR_LOG=()
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
+log()  { echo "[$(date +%H:%M:%S)] $*"; }
+warn() { echo "[$(date +%H:%M:%S)] WARNING: $*" >&2; }
+fatal() {
+  echo "[$(date +%H:%M:%S)] FATAL: $*" >&2
+  exit 1
+}
+
+# ─── Time Budget ─────────────────────────────────────────────────────────────
+elapsed_seconds() { echo $(( $(date +%s) - START_EPOCH )); }
+
+check_soft_cutoff() {
+  local elapsed
+  elapsed=$(elapsed_seconds)
+  (( elapsed < SOFT_CUTOFF ))
+}
+
+check_hard_deadline() {
+  local elapsed
+  elapsed=$(elapsed_seconds)
+  (( elapsed < HARD_DEADLINE ))
+}
+
+format_duration() {
+  local secs="$1"
+  printf '%dh %02dm %02ds' $((secs/3600)) $(((secs%3600)/60)) $((secs%60))
+}
+
+# ─── Disk Space ──────────────────────────────────────────────────────────────
+get_avail_bytes() {
+  df --output=avail -B1 "$WORK_DIR" | tail -1 | tr -d ' '
+}
+
+check_disk_gib() {
+  local required_gib="$1"
+  local avail_bytes
+  avail_bytes=$(get_avail_bytes)
+  local required_bytes=$(( required_gib * 1073741824 ))
+  (( avail_bytes >= required_bytes ))
+}
+
+check_disk_bytes() {
+  local required_bytes="$1"
+  local avail_bytes
+  avail_bytes=$(get_avail_bytes)
+  (( avail_bytes >= required_bytes ))
+}
+
+# ─── Rate Limit ──────────────────────────────────────────────────────────────
+check_rate_limit() {
+  API_CALL_COUNT=$((API_CALL_COUNT + 1))
+  if (( API_CALL_COUNT % RATE_LIMIT_CHECK_INTERVAL != 0 )); then
+    return 0
+  fi
+
+  local rate_json remaining reset
+  rate_json=$(gh api rate_limit 2>/dev/null) || return 0
+  remaining=$(echo "$rate_json" | jq -r '.resources.core.remaining' 2>/dev/null) || return 0
+  reset=$(echo "$rate_json" | jq -r '.resources.core.reset' 2>/dev/null) || return 0
+
+  if [[ -z "$remaining" ]] || [[ -z "$reset" ]]; then
+    return 0
+  fi
+
+  if (( remaining < RATE_LIMIT_MIN_REMAINING )); then
+    if (( remaining == 0 )); then
+      warn "Rate limit exhausted (0 remaining). Aborting."
+      return 1
+    fi
+    local now wait_secs
+    now=$(date +%s)
+    wait_secs=$(( reset - now + 5 ))
+    if (( wait_secs > 0 && wait_secs < 3600 )); then
+      warn "Rate limit low ($remaining remaining). Sleeping ${wait_secs}s until reset."
+      sleep "$wait_secs"
+    elif (( wait_secs >= 3600 )); then
+      warn "Rate limit exhausted, reset too far away (${wait_secs}s). Aborting."
+      return 1
+    fi
+  fi
+}
+
+# ─── URL Parsing ─────────────────────────────────────────────────────────────
+parse_urls() {
+  local factory_file="$1" ota_file="$2"
+  local line device filename
+  local reject_count=0
+
+  # Parse factory images
+  if [[ -f "$factory_file" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%$'\r'}"
+      [[ -z "$line" ]] && continue
+
+      if [[ "$line" =~ $FACTORY_RE ]]; then
+        device="${BASH_REMATCH[1]}"
+        filename=$(basename "$line")
+        URL_LIST+=("$line")
+        DEVICE_LIST+=("$device")
+        TYPE_LIST+=("factory")
+        FILENAME_LIST+=("$filename")
+      else
+        warn "Rejected factory line: $line"
+        reject_count=$((reject_count + 1))
+      fi
+    done < "$factory_file"
+  fi
+
+  # Parse OTA images
+  if [[ -f "$ota_file" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%$'\r'}"
+      [[ -z "$line" ]] && continue
+
+      if [[ "$line" =~ $OTA_RE ]]; then
+        device="${BASH_REMATCH[1]}"
+        filename=$(basename "$line")
+        URL_LIST+=("$line")
+        DEVICE_LIST+=("$device")
+        TYPE_LIST+=("ota")
+        FILENAME_LIST+=("$filename")
+      else
+        warn "Rejected OTA line: $line"
+        reject_count=$((reject_count + 1))
+      fi
+    done < "$ota_file"
+  fi
+
+  if (( reject_count > 0 )); then
+    warn "$reject_count lines rejected during parsing"
+  fi
+  log "Parsed ${#URL_LIST[@]} URLs (${reject_count} rejected)"
+}
+
+# ─── Grouping ────────────────────────────────────────────────────────────────
+build_groups() {
+  GROUP_INDICES=()
+  for (( i=0; i<${#URL_LIST[@]}; i++ )); do
+    local key="${DEVICE_LIST[$i]}:${TYPE_LIST[$i]}"
+    GROUP_INDICES["$key"]+="$i "
+  done
+  log "Found ${#GROUP_INDICES[@]} device+type groups"
+}
+
+# ─── Filtering ───────────────────────────────────────────────────────────────
+apply_filters() {
+  if [[ -z "$DEVICE_FILTER" ]] && [[ "$TYPE_FILTER" == "all" ]]; then
+    return 0
+  fi
+
+  # Validate device_filter format
+  if [[ -n "$DEVICE_FILTER" ]] && ! [[ "$DEVICE_FILTER" =~ ^[a-z0-9._]+$ ]]; then
+    fatal "Invalid device_filter: '$DEVICE_FILTER' (must match ^[a-z0-9._]+\$)"
+  fi
+
+  local -a new_urls=() new_devices=() new_types=() new_filenames=()
+
+  for (( i=0; i<${#URL_LIST[@]}; i++ )); do
+    # Device filter: exact match
+    if [[ -n "$DEVICE_FILTER" ]] && [[ "${DEVICE_LIST[$i]}" != "$DEVICE_FILTER" ]]; then
+      continue
+    fi
+    # Type filter
+    if [[ "$TYPE_FILTER" != "all" ]] && [[ "${TYPE_LIST[$i]}" != "$TYPE_FILTER" ]]; then
+      continue
+    fi
+    new_urls+=("${URL_LIST[$i]}")
+    new_devices+=("${DEVICE_LIST[$i]}")
+    new_types+=("${TYPE_LIST[$i]}")
+    new_filenames+=("${FILENAME_LIST[$i]}")
+  done
+
+  if (( ${#new_urls[@]} == 0 )); then
+    fatal "No URLs match filters (device='${DEVICE_FILTER}', type='${TYPE_FILTER}')"
+  fi
+
+  URL_LIST=("${new_urls[@]}")
+  DEVICE_LIST=("${new_devices[@]}")
+  TYPE_LIST=("${new_types[@]}")
+  FILENAME_LIST=("${new_filenames[@]}")
+
+  log "After filtering: ${#URL_LIST[@]} URLs"
+}
+
+# ─── Release Management ─────────────────────────────────────────────────────
+generate_notes() {
+  local device="$1" ftype="$2" notes_file="$3"
+
+  local source_url
+  if [[ "$ftype" == "factory" ]]; then
+    source_url="https://developers.google.com/android/images"
+  else
+    source_url="https://developers.google.com/android/ota"
+  fi
+
+  local type_label
+  if [[ "$ftype" == "factory" ]]; then
+    type_label="Factory Images"
+  else
+    type_label="Full OTA Images"
+  fi
+
+  cat > "$notes_file" <<EOF
+# ${device} — ${type_label}
+
+These firmware images are mirrored from Google's official distribution for archival and convenience.
+
+**Source:** ${source_url}
+
+> **Disclaimer:** These files are provided by Google Inc. This repository mirrors them as-is.
+> Google and Pixel are trademarks of Google LLC.
+
+## Split Files
+
+Some firmware files exceed GitHub's 2 GB asset size limit and have been split.
+
+**To reassemble:**
+
+\`\`\`bash
+# Download all .partNN files and the .sha256 manifest for the firmware
+cat <filename>.part* > <filename>
+sha256sum --check <filename>.sha256
+\`\`\`
+
+Parts are named \`<original>.part01\`, \`<original>.part02\`, etc.
+The \`.sha256\` manifest contains checksums for the original file and every part.
+EOF
+}
+
+ensure_release() {
+  local tag="$1" device="$2" ftype="$3"
+
+  check_rate_limit || return 1
+
+  local type_label
+  if [[ "$ftype" == "factory" ]]; then
+    type_label="Factory Images"
+  else
+    type_label="Full OTA Images"
+  fi
+  local title="${device} - ${type_label}"
+
+  # Check if release exists — distinguish 404 from auth/rate-limit errors
+  local release_json api_stderr api_exit
+  api_stderr=$(mktemp)
+  release_json=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>"$api_stderr") && api_exit=0 || api_exit=$?
+
+  if (( api_exit == 0 )); then
+    CURRENT_RELEASE_ID=$(echo "$release_json" | jq -r '.id')
+    log "Release exists: $tag (id=$CURRENT_RELEASE_ID)"
+    rm -f "$api_stderr"
+    return 0
+  fi
+
+  # Check if it's a genuine 404 (release doesn't exist) vs a fatal error
+  local err_msg
+  err_msg=$(cat "$api_stderr" 2>/dev/null || true)
+  rm -f "$api_stderr"
+  if echo "$err_msg" | grep -qi "401\|403\|authentication\|credential\|permission"; then
+    warn "Auth/permission error checking release $tag: $err_msg"
+    return 1
+  fi
+  if echo "$err_msg" | grep -qi "rate limit\|429"; then
+    warn "Rate limit error checking release $tag: $err_msg"
+    return 1
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log "[DRY RUN] Would create release: $tag"
+    CURRENT_RELEASE_ID="dry-run"
+    return 0
+  fi
+
+  # Create release
+  log "Creating release: $tag"
+  local notes_file="$WORK_DIR/release-notes.md"
+  generate_notes "$device" "$ftype" "$notes_file"
+
+  local create_output
+  if ! create_output=$(gh release create "$tag" \
+    --title "$title" \
+    --notes-file "$notes_file" \
+    --latest=false 2>&1); then
+    warn "Failed to create release $tag: $create_output"
+    rm -f "$notes_file"
+    return 1
+  fi
+  rm -f "$notes_file"
+
+  # Get the release ID
+  release_json=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" 2>/dev/null) || {
+    warn "Release created but cannot fetch ID for $tag"
+    return 1
+  }
+  CURRENT_RELEASE_ID=$(echo "$release_json" | jq -r '.id')
+  log "Release created: $tag (id=$CURRENT_RELEASE_ID)"
+}
+
+# ─── Asset Inventory ────────────────────────────────────────────────────────
+load_assets() {
+  local release_id="$1"
+  ASSET_CACHE=()
+
+  check_rate_limit || return 1
+
+  if [[ "$release_id" == "dry-run" ]]; then
+    return 0
+  fi
+
+  local name id size state
+  local api_output api_exit
+  api_output=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets" \
+    --jq '.[] | [.name, .id, .size, .state] | @tsv' 2>&1)
+  api_exit=$?
+
+  if (( api_exit != 0 )); then
+    warn "Failed to load assets for release $release_id: $api_output"
+    return 1
+  fi
+
+  while IFS=$'\t' read -r name id size state; do
+    [[ -z "$name" ]] && continue
+    ASSET_CACHE["$name"]="$id $size $state"
+  done <<< "$api_output"
+
+  log "Loaded ${#ASSET_CACHE[@]} assets for release $release_id"
+}
+
+asset_exists() {
+  local name="$1"
+  if [[ -v "ASSET_CACHE[$name]" ]]; then
+    local parts
+    read -ra parts <<< "${ASSET_CACHE[$name]}"
+    local size="${parts[1]}"
+    local state="${parts[2]}"
+    [[ "$state" == "uploaded" ]] && (( size > 0 ))
+  else
+    return 1
+  fi
+}
+
+# Check if any split parts exist without a manifest (partial split)
+has_partial_split() {
+  local filename="$1"
+  local manifest="${filename}.sha256"
+
+  # If manifest exists, split is complete
+  if asset_exists "$manifest"; then
+    return 1
+  fi
+
+  # Check for any part files
+  for key in "${!ASSET_CACHE[@]}"; do
+    if [[ "$key" == "${filename}.part"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ─── Download ────────────────────────────────────────────────────────────────
+download_file() {
+  local url="$1" output="$2"
+  local attempt=0 aria2_exit
+  local aria2_control="${output}.aria2"
+
+  while (( attempt < DOWNLOAD_MAX_ATTEMPTS )); do
+    attempt=$((attempt + 1))
+
+    if ! check_hard_deadline; then
+      warn "Hard deadline reached during download"
+      return 2
+    fi
+
+    local elapsed remaining aria2_timeout
+    elapsed=$(elapsed_seconds)
+    remaining=$((HARD_DEADLINE - elapsed))
+    aria2_timeout=$remaining
+    (( aria2_timeout > 5400 )) && aria2_timeout=5400
+
+    log "  Download attempt $attempt/$DOWNLOAD_MAX_ATTEMPTS (${remaining}s remaining)"
+    rm -f "$output" "$aria2_control"
+
+    set +e
+    timeout "$aria2_timeout" aria2c \
+      --connect-timeout=30 \
+      --timeout=60 \
+      --max-tries=1 \
+      --split=16 \
+      --max-connection-per-server=16 \
+      --min-split-size=20M \
+      --allow-overwrite=true \
+      --auto-file-renaming=false \
+      --console-log-level=warn \
+      --summary-interval=0 \
+      --dir="$(dirname "$output")" \
+      --out="$(basename "$output")" \
+      "$url" 2>&1
+    aria2_exit=$?
+    set -Eeuo pipefail
+
+    rm -f "$aria2_control"
+    log "  aria2c exit=$aria2_exit"
+
+    if (( aria2_exit == 0 )) && [[ -s "$output" ]]; then
+      return 0
+    fi
+
+    case $aria2_exit in
+      3|13)
+        warn "Non-retryable aria2c error $aria2_exit"
+        rm -f "$output"
+        return 1
+        ;;
+    esac
+
+    # Backoff before retry
+    if (( attempt < DOWNLOAD_MAX_ATTEMPTS )); then
+      local delay=${BACKOFF_DELAYS[$attempt]:-300}
+      local now_elapsed
+      now_elapsed=$(elapsed_seconds)
+      local remain=$((HARD_DEADLINE - now_elapsed))
+      (( delay > remain )) && delay=$remain
+      if (( delay > 0 )); then
+        log "  Retrying in ${delay}s..."
+        sleep "$delay"
+      fi
+    fi
+  done
+
+  rm -f "$output"
+  warn "Download failed after $attempt attempts"
+  return 1
+}
+
+# ─── ZIP Validation ──────────────────────────────────────────────────────────
+validate_zip() {
+  local filepath="$1"
+
+  # Non-empty
+  if [[ ! -s "$filepath" ]]; then
+    warn "File is empty: $filepath"
+    return 1
+  fi
+
+  # Magic bytes: PK\x03\x04
+  local magic
+  magic=$(xxd -l 4 -p "$filepath" 2>/dev/null || echo "")
+  if [[ "$magic" != "504b0304" ]]; then
+    warn "Invalid ZIP magic bytes: $magic (expected 504b0304)"
+    return 1
+  fi
+
+  # Integrity check
+  if ! unzip -tqq "$filepath" >/dev/null 2>&1; then
+    warn "ZIP integrity check failed: $filepath"
+    return 1
+  fi
+
+  return 0
+}
+
+# ─── File Splitting ──────────────────────────────────────────────────────────
+split_file() {
+  local filepath="$1"
+  local filename
+  filename=$(basename "$filepath")
+
+  log "  Splitting $filename (threshold exceeded)"
+
+  # Check disk before split
+  local file_size
+  file_size=$(stat -c%s "$filepath")
+  local needed=$((file_size + 536870912))  # source_size + 512 MiB
+  if ! check_disk_bytes "$needed"; then
+    warn "Not enough disk for split (need ~$((needed / 1073741824)) GiB)"
+    return 1
+  fi
+
+  # Split
+  split --bytes="$SPLIT_SIZE" --numeric-suffixes=1 --suffix-length=2 \
+    -- "$filepath" "${filepath}.part"
+
+  # Generate SHA256 manifest (original + all parts) using basenames
+  local manifest="${filepath}.sha256"
+  ( cd "$WORK_DIR" && sha256sum "$filename" "${filename}.part"* ) > "$manifest"
+
+  # Delete original to free disk
+  rm -f "$filepath"
+
+  log "  Split complete: $(ls "${filepath}.part"* 2>/dev/null | wc -l) parts + manifest"
+  return 0
+}
+
+# ─── Upload ──────────────────────────────────────────────────────────────────
+upload_asset() {
+  local tag="$1" filepath="$2"
+  local filename
+  filename=$(basename "$filepath")
+  local local_size
+  local_size=$(stat -c%s "$filepath")
+
+  check_rate_limit || return 1
+
+  log "  Uploading $filename ($(( local_size / 1048576 )) MiB)..."
+
+  # First attempt (no clobber)
+  if ! gh release upload "$tag" "$filepath" 2>/dev/null; then
+    # Check if asset already exists but is bad (wrong state/size) before clobbering
+    if [[ -v "ASSET_CACHE[$filename]" ]]; then
+      local cached_parts
+      read -ra cached_parts <<< "${ASSET_CACHE[$filename]}"
+      local cached_state="${cached_parts[2]:-}"
+      if [[ "$cached_state" != "uploaded" ]]; then
+        warn "Existing asset $filename in bad state ($cached_state), clobbering"
+        gh release upload "$tag" "$filepath" --clobber 2>/dev/null || {
+          warn "Clobber upload failed for $filename"
+          return 1
+        }
+      else
+        warn "Upload failed for $filename but asset exists as uploaded; verifying"
+      fi
+    else
+      warn "Upload failed for $filename, retrying with --clobber"
+      gh release upload "$tag" "$filepath" --clobber 2>/dev/null || {
+        warn "Clobber retry failed for $filename"
+        return 1
+      }
+    fi
+  fi
+
+  # Verify upload
+  if verify_upload "$filename" "$local_size"; then
+    log "  Verified: $filename"
+    return 0
+  fi
+
+  # Retry once on verification failure
+  warn "Verification failed for $filename, retrying upload with --clobber"
+  if ! gh release upload "$tag" "$filepath" --clobber 2>/dev/null; then
+    warn "Upload retry failed for $filename"
+    return 1
+  fi
+
+  if verify_upload "$filename" "$local_size"; then
+    log "  Verified on retry: $filename"
+    return 0
+  fi
+
+  warn "Upload verification failed after retry: $filename"
+  return 1
+}
+
+verify_upload() {
+  local filename="$1" expected_size="$2"
+
+  check_rate_limit || return 1
+
+  local result
+  result=$(gh api --paginate \
+    "repos/${GITHUB_REPOSITORY}/releases/${CURRENT_RELEASE_ID}/assets" \
+    --jq ".[] | select(.name == \"${filename}\") | [.id, .size, .state] | @tsv" \
+    2>/dev/null) || return 1
+
+  [[ -z "$result" ]] && return 1
+
+  local id size state
+  IFS=$'\t' read -r id size state <<< "$result"
+
+  if [[ "$state" == "uploaded" ]] && (( size == expected_size )); then
+    ASSET_CACHE["$filename"]="$id $size uploaded"
+    return 0
+  fi
+  return 1
+}
+
+# ─── Per-URL Pipeline ────────────────────────────────────────────────────────
+process_url() {
+  local url="$1" tag="$2" filename="$3"
+  local filepath="$WORK_DIR/$filename"
+
+  TOTAL_SCANNED=$((TOTAL_SCANNED + 1))
+
+  # Skip check: direct asset exists
+  if asset_exists "$filename"; then
+    log "  SKIP (exists): $filename"
+    TOTAL_SKIPPED=$((TOTAL_SKIPPED + 1))
+    return 0
+  fi
+
+  # Skip check: split manifest exists (split complete)
+  if asset_exists "${filename}.sha256"; then
+    log "  SKIP (split complete): $filename"
+    TOTAL_SKIPPED=$((TOTAL_SKIPPED + 1))
+    return 0
+  fi
+
+  # Check for partial split (parts exist, no manifest)
+  local partial_split=false
+  if has_partial_split "$filename"; then
+    partial_split=true
+    log "  Detected partial split for $filename, will re-download and complete"
+  fi
+
+  # Disk check
+  if ! check_disk_gib "$MIN_DISK_GIB"; then
+    local avail
+    avail=$(( $(get_avail_bytes) / 1073741824 ))
+    warn "Insufficient disk: ${avail} GiB < ${MIN_DISK_GIB} GiB required"
+    if (( avail < 1 )); then
+      fatal "Disk critically low (<1 GiB). Aborting."
+    fi
+    return 1
+  fi
+
+  # Download
+  log "  Downloading: $filename"
+  if ! download_file "$url" "$filepath"; then
+    TOTAL_FAILED=$((TOTAL_FAILED + 1))
+    CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+    ERROR_LOG+=("DOWNLOAD_FAIL|${filename}|${tag}")
+    rm -f "$filepath"
+    return 1
+  fi
+
+  # Validate ZIP
+  if ! validate_zip "$filepath"; then
+    TOTAL_FAILED=$((TOTAL_FAILED + 1))
+    CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+    ERROR_LOG+=("VALIDATE_FAIL|${filename}|${tag}")
+    rm -f "$filepath"
+    return 1
+  fi
+
+  # Check file size for split decision
+  local file_size
+  file_size=$(stat -c%s "$filepath")
+  log "  Size: $(( file_size / 1048576 )) MiB"
+
+  if (( file_size > SPLIT_THRESHOLD )); then
+    # ── Split path ──
+    TOTAL_SPLIT_UPLOADS=$((TOTAL_SPLIT_UPLOADS + 1))
+
+    if ! split_file "$filepath"; then
+      TOTAL_FAILED=$((TOTAL_FAILED + 1))
+      CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+      ERROR_LOG+=("SPLIT_FAIL|${filename}|${tag}")
+      rm -f "$WORK_DIR/${filename}"* 2>/dev/null
+      return 1
+    fi
+
+    # Upload parts serially, skip already-uploaded parts (partial resume)
+    local part_files=()
+    while IFS= read -r -d '' pf; do
+      part_files+=("$pf")
+    done < <(find "$WORK_DIR" -name "${filename}.part*" -not -name "*.sha256" -print0 | sort -z)
+
+    local upload_ok=true
+    for part_file in "${part_files[@]}"; do
+      local part_name
+      part_name=$(basename "$part_file")
+
+      # Skip parts already uploaded (partial resume)
+      if [[ "$partial_split" == "true" ]] && asset_exists "$part_name"; then
+        log "  SKIP part (exists): $part_name"
+        continue
+      fi
+
+      if ! check_hard_deadline; then
+        warn "Hard deadline during split upload"
+        upload_ok=false
+        break
+      fi
+
+      if ! upload_asset "$tag" "$part_file"; then
+        upload_ok=false
+        ERROR_LOG+=("UPLOAD_FAIL|${part_name}|${tag}")
+        break
+      fi
+      # Delete part immediately after successful upload to free disk
+      rm -f "$part_file"
+    done
+
+    if [[ "$upload_ok" == "true" ]]; then
+      # Upload manifest LAST (completion marker)
+      local manifest="$WORK_DIR/${filename}.sha256"
+      if [[ -f "$manifest" ]]; then
+        if ! upload_asset "$tag" "$manifest"; then
+          upload_ok=false
+          ERROR_LOG+=("UPLOAD_FAIL|${filename}.sha256|${tag}")
+        fi
+      fi
+    fi
+
+    # Cleanup all local split files
+    rm -f "$WORK_DIR/${filename}"* 2>/dev/null
+
+    if [[ "$upload_ok" != "true" ]]; then
+      TOTAL_FAILED=$((TOTAL_FAILED + 1))
+      CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+      return 1
+    fi
+  else
+    # ── Direct upload path ──
+    if ! upload_asset "$tag" "$filepath"; then
+      TOTAL_FAILED=$((TOTAL_FAILED + 1))
+      CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
+      ERROR_LOG+=("UPLOAD_FAIL|${filename}|${tag}")
+      rm -f "$filepath"
+      return 1
+    fi
+    rm -f "$filepath"
+  fi
+
+  TOTAL_UPLOADED=$((TOTAL_UPLOADED + 1))
+  CONSECUTIVE_FAILURES=0
+  return 0
+}
+
+# ─── Per-Group Processing ───────────────────────────────────────────────────
+process_group() {
+  local device="$1" ftype="$2" index_str="$3"
+  local tag="firmware-${device}-${ftype}"
+
+  local -a indices
+  read -ra indices <<< "$index_str"
+  local group_total=${#indices[@]}
+  local group_done=0 group_skip=0 group_fail=0
+
+  log "━━━ Processing: $device / $ftype ($group_total URLs, tag=$tag) ━━━"
+
+  # Create/verify release
+  if ! ensure_release "$tag" "$device" "$ftype"; then
+    warn "Failed to ensure release for $tag"
+    DEVICE_RESULTS+=("${device}|${ftype}|${group_total}|0|0|${group_total}")
+    TOTAL_FAILED=$((TOTAL_FAILED + group_total))
+    return 1
+  fi
+
+  # Load asset inventory
+  if ! load_assets "$CURRENT_RELEASE_ID"; then
+    warn "Failed to load assets for $tag"
+    DEVICE_RESULTS+=("${device}|${ftype}|${group_total}|0|0|${group_total}")
+    TOTAL_FAILED=$((TOTAL_FAILED + group_total))
+    return 1
+  fi
+
+  # Process each URL in group
+  for idx in "${indices[@]}"; do
+    # Time budget checks
+    if ! check_soft_cutoff; then
+      log "Soft cutoff reached, stopping new URLs"
+      BUDGET_STOP=true
+      break
+    fi
+    if ! check_hard_deadline; then
+      log "Hard deadline reached, aborting"
+      BUDGET_STOP=true
+      break
+    fi
+
+    # Consecutive failure check
+    if (( CONSECUTIVE_FAILURES >= MAX_CONSECUTIVE_FAILURES )); then
+      warn "Aborting: $MAX_CONSECUTIVE_FAILURES consecutive failures"
+      DEVICE_RESULTS+=("${device}|${ftype}|${group_total}|${group_done}|${group_skip}|${group_fail}")
+      return 1
+    fi
+
+    local url="${URL_LIST[$idx]}"
+    local filename="${FILENAME_LIST[$idx]}"
+
+    local old_skipped=$TOTAL_SKIPPED
+    local old_uploaded=$TOTAL_UPLOADED
+    local old_failed=$TOTAL_FAILED
+
+    process_url "$url" "$tag" "$filename" || true
+
+    # Track per-group stats
+    if (( TOTAL_SKIPPED > old_skipped )); then
+      group_skip=$((group_skip + 1))
+      group_done=$((group_done + 1))
+    elif (( TOTAL_UPLOADED > old_uploaded )); then
+      group_done=$((group_done + 1))
+    elif (( TOTAL_FAILED > old_failed )); then
+      group_fail=$((group_fail + 1))
+    fi
+  done
+
+  DEVICE_RESULTS+=("${device}|${ftype}|${group_total}|${group_done}|${group_skip}|${group_fail}")
+  log "━━━ Done: $device / $ftype — done=$group_done skip=$group_skip fail=$group_fail ━━━"
+}
+
+# ─── Dry Run Report ─────────────────────────────────────────────────────────
+dry_run_report() {
+  log "=== DRY RUN REPORT ==="
+
+  local new_releases=0 missing_assets=0 existing_assets=0
+
+  for group in $(printf '%s\n' "${!GROUP_INDICES[@]}" | sort); do
+    local device="${group%%:*}"
+    local ftype="${group#*:}"
+    local tag="firmware-${device}-${ftype}"
+    local index_str="${GROUP_INDICES[$group]}"
+    local -a indices
+    read -ra indices <<< "$index_str"
+
+    # Check release
+    local release_exists=false
+    if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" &>/dev/null; then
+      release_exists=true
+    else
+      new_releases=$((new_releases + 1))
+    fi
+
+    local group_missing=0 group_existing=0
+
+    if [[ "$release_exists" == "true" ]]; then
+      # Load assets to check
+      local release_id
+      release_id=$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq '.id' 2>/dev/null || echo "")
+
+      if [[ -n "$release_id" ]]; then
+        load_assets "$release_id"
+
+        for idx in "${indices[@]}"; do
+          local filename="${FILENAME_LIST[$idx]}"
+          if asset_exists "$filename" || asset_exists "${filename}.sha256"; then
+            group_existing=$((group_existing + 1))
+          else
+            group_missing=$((group_missing + 1))
+          fi
+        done
+      else
+        group_missing=${#indices[@]}
+      fi
+    else
+      group_missing=${#indices[@]}
+    fi
+
+    existing_assets=$((existing_assets + group_existing))
+    missing_assets=$((missing_assets + group_missing))
+
+    local status_icon="✅"
+    [[ "$release_exists" == "false" ]] && status_icon="🆕"
+    log "  ${status_icon} ${device}/${ftype}: ${#indices[@]} total, ${group_existing} existing, ${group_missing} to upload"
+  done
+
+  log ""
+  log "Summary:"
+  log "  Groups:          ${#GROUP_INDICES[@]}"
+  log "  New releases:    $new_releases"
+  log "  Total URLs:      ${#URL_LIST[@]}"
+  log "  Already uploaded: $existing_assets"
+  log "  To upload:       $missing_assets"
+
+  # Write to GITHUB_STEP_SUMMARY if available
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+
+## 🔍 Firmware Publisher — Dry Run
+
+| Metric | Value |
+|--------|-------|
+| Device/type groups | ${#GROUP_INDICES[@]} |
+| New releases needed | ${new_releases} |
+| Total URLs | ${#URL_LIST[@]} |
+| Already uploaded | ${existing_assets} |
+| To upload | ${missing_assets} |
+
+EOF
+  fi
+}
+
+# ─── Summary Report ─────────────────────────────────────────────────────────
+write_summary() {
+  local elapsed
+  elapsed=$(elapsed_seconds)
+  local duration
+  duration=$(format_duration "$elapsed")
+
+  log ""
+  log "══════════════════════════════════════════════════════════"
+  log " Firmware Publisher Summary"
+  log "══════════════════════════════════════════════════════════"
+  log "  Targeted:   $TOTAL_TARGETED URLs in ${#GROUP_INDICES[@]} groups"
+  log "  Scanned:    $TOTAL_SCANNED"
+  log "  Skipped:    $TOTAL_SKIPPED (existing)"
+  log "  Uploaded:   $TOTAL_UPLOADED ($TOTAL_SPLIT_UPLOADS split)"
+  log "  Failed:     $TOTAL_FAILED"
+  log "  Duration:   $duration"
+  log "  Budget stop: $BUDGET_STOP"
+
+  # GITHUB_STEP_SUMMARY
+  if [[ -z "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    return 0
+  fi
+
+  cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+
+## 📊 Firmware Publisher Summary
+
+| Metric | Value |
+|--------|-------|
+| Targeted | ${TOTAL_TARGETED} URLs, ${#GROUP_INDICES[@]} groups |
+| Scanned | ${TOTAL_SCANNED} |
+| Skipped (existing) | ${TOTAL_SKIPPED} |
+| Uploaded | ${TOTAL_UPLOADED} (${TOTAL_SPLIT_UPLOADS} split) |
+| Failed | ${TOTAL_FAILED} |
+| Duration | ${duration} |
+| Budget stop | ${BUDGET_STOP} |
+
+EOF
+
+  # Per-device table
+  if (( ${#DEVICE_RESULTS[@]} > 0 )); then
+    cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+<details><summary>Device Details</summary>
+
+| Device | Type | Total | Done | Skip | Fail |
+|--------|------|-------|------|------|------|
+EOF
+
+    for entry in "${DEVICE_RESULTS[@]}"; do
+      IFS='|' read -r d t total ok skip fail <<< "$entry"
+      echo "| ${d} | ${t} | ${total} | ${ok} | ${skip} | ${fail} |" >> "$GITHUB_STEP_SUMMARY"
+    done
+
+    echo "" >> "$GITHUB_STEP_SUMMARY"
+    echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+  fi
+
+  # Error details
+  if (( ${#ERROR_LOG[@]} > 0 )); then
+    cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+
+<details><summary>Error Details</summary>
+
+| Type | File | Release |
+|------|------|---------|
+EOF
+
+    for entry in "${ERROR_LOG[@]}"; do
+      IFS='|' read -r etype efile etag <<< "$entry"
+      echo "| ${etype} | ${efile} | ${etag} |" >> "$GITHUB_STEP_SUMMARY"
+    done
+
+    echo "" >> "$GITHUB_STEP_SUMMARY"
+    echo "</details>" >> "$GITHUB_STEP_SUMMARY"
+  fi
+}
+
+# ─── Cleanup ─────────────────────────────────────────────────────────────────
+cleanup() {
+  local exit_code=$?
+  write_summary
+  if [[ -n "$WORK_DIR" ]] && [[ -d "$WORK_DIR" ]]; then
+    rm -rf "$WORK_DIR"
+  fi
+  log "Cleanup complete (exit=$exit_code)"
+}
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+main() {
+  trap cleanup EXIT INT TERM
+
+  # Create working directory
+  local base_dir="${RUNNER_TEMP:-/tmp}"
+  WORK_DIR=$(mktemp -d "${base_dir}/firmware-publisher.XXXXXX")
+  log "Work dir: $WORK_DIR"
+
+  # Resolve source files
+  local repo_root
+  repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+  local factory_file="$repo_root/FactoryImages.txt"
+  local ota_file="$repo_root/FullOTAImages.txt"
+
+  log "Parsing URLs..."
+  parse_urls "$factory_file" "$ota_file"
+
+  if (( ${#URL_LIST[@]} == 0 )); then
+    fatal "No URLs parsed from source files"
+  fi
+
+  # Apply filters
+  apply_filters
+  TOTAL_TARGETED=${#URL_LIST[@]}
+
+  # Build groups
+  build_groups
+
+  log "Configuration:"
+  log "  device_filter: '${DEVICE_FILTER:-<all>}'"
+  log "  type_filter:   $TYPE_FILTER"
+  log "  dry_run:       $DRY_RUN"
+  log "  URLs:          $TOTAL_TARGETED"
+  log "  Groups:        ${#GROUP_INDICES[@]}"
+  log "  Disk free:     $(( $(get_avail_bytes) / 1073741824 )) GiB"
+
+  # Dry run mode
+  if [[ "$DRY_RUN" == "true" ]]; then
+    dry_run_report
+    exit 0
+  fi
+
+  # Process each device+type group
+  for group in $(printf '%s\n' "${!GROUP_INDICES[@]}" | sort); do
+    if [[ "$BUDGET_STOP" == "true" ]]; then
+      log "Budget stop active, skipping remaining groups"
+      break
+    fi
+
+    if (( CONSECUTIVE_FAILURES >= MAX_CONSECUTIVE_FAILURES )); then
+      warn "Aborting all processing: $MAX_CONSECUTIVE_FAILURES consecutive failures"
+      break
+    fi
+
+    if ! check_soft_cutoff; then
+      log "Soft cutoff reached, no new groups"
+      BUDGET_STOP=true
+      break
+    fi
+
+    local device="${group%%:*}"
+    local ftype="${group#*:}"
+    process_group "$device" "$ftype" "${GROUP_INDICES[$group]}"
+  done
+
+  log "Processing complete"
+  # Exit 0 even on budget stop (resume on next run)
+}
+
+main "$@"

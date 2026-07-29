@@ -1,0 +1,419 @@
+name: Test Firmware Download
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" .
+
+      - name: Log environment
+        run: |
+          set -euo pipefail
+          echo "## Environment" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Runner: $(uname -a)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- curl: $(curl --version | head -1)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Disk:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          df -h "$RUNNER_TEMP" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          RAW_IP=$(curl -sf --max-time 10 https://ifconfig.me || echo "unknown")
+          RUNNER_IP=$(echo "$RAW_IP" | head -1 | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || echo "unknown")
+          echo "- Public IP: $RUNNER_IP" >> "$GITHUB_STEP_SUMMARY"
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+
+      - name: Extract latest firmware URL
+        id: extract
+        run: |
+          set -euo pipefail
+          if [ ! -f FactoryImages.txt ]; then
+            echo "::error::FactoryImages.txt not found"
+            echo "RESULT=input_error" >> "$GITHUB_ENV"
+            echo "RESULT_DETAIL=FactoryImages.txt not found" >> "$GITHUB_ENV"
+            exit 1
+          fi
+          URL=$(head -1 FactoryImages.txt | tr -d '\r')
+          if [ -z "$URL" ]; then
+            echo "::error::First line of FactoryImages.txt is empty"
+            echo "RESULT=input_error" >> "$GITHUB_ENV"
+            echo "RESULT_DETAIL=First line is empty" >> "$GITHUB_ENV"
+            exit 1
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Firmware URL: $URL"
+
+      - name: Validate URL pattern
+        env:
+          FIRMWARE_URL: ${{ steps.extract.outputs.url }}
+        run: |
+          set -euo pipefail
+          PATTERN='^https://dl\.google\.com/dl/android/aosp/[A-Za-z0-9._-]+-factory-[0-9a-f]{8}\.zip$'
+          if ! echo "$FIRMWARE_URL" | grep -qE "$PATTERN"; then
+            echo "::error::URL does not match expected factory image pattern"
+            echo "RESULT=input_error" >> "$GITHUB_ENV"
+            echo "RESULT_DETAIL=Invalid URL pattern" >> "$GITHUB_ENV"
+            exit 1
+          fi
+          echo "URL pattern validated: $FIRMWARE_URL"
+
+      - name: Check disk space
+        run: |
+          set -euo pipefail
+          AVAIL_KB=$(df --output=avail -B1K "$RUNNER_TEMP" | tail -1 | tr -d ' ')
+          AVAIL_GB=$((AVAIL_KB / 1048576))
+          echo "Available disk: ${AVAIL_GB} GiB"
+          if [ "$AVAIL_GB" -lt 8 ]; then
+            echo "::error::Insufficient disk space: ${AVAIL_GB} GiB < 8 GiB required"
+            echo "RESULT=insufficient_disk" >> "$GITHUB_ENV"
+            echo "RESULT_DETAIL=Only ${AVAIL_GB} GiB available" >> "$GITHUB_ENV"
+            exit 1
+          fi
+
+      - name: Download firmware
+        id: download
+        env:
+          FIRMWARE_URL: ${{ steps.extract.outputs.url }}
+        run: |
+          set -uo pipefail
+          ARCHIVE="$RUNNER_TEMP/firmware.zip"
+          HEADERS="$RUNNER_TEMP/headers.txt"
+          METRICS="$RUNNER_TEMP/metrics.txt"
+          FILENAME=$(basename "$FIRMWARE_URL")
+
+          MAX_ATTEMPTS=3
+          TOTAL_BUDGET=6000
+          START_EPOCH=$(date +%s)
+          ATTEMPT=0
+          FINAL_HTTP="000"
+          FINAL_EXIT=1
+          HAD_429=false
+
+          # Retryable curl exits (FR-6 allowlist)
+          is_retryable_curl() {
+            case $1 in
+              5|6|7|18|28|35|52|55|56) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          # Retryable HTTP codes (FR-6 allowlist)
+          is_retryable_http() {
+            case $1 in
+              408|429|500|502|503|504) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            ELAPSED=$(($(date +%s) - START_EPOCH))
+            REMAINING=$((TOTAL_BUDGET - ELAPSED))
+
+            if [ $REMAINING -lt 120 ]; then
+              echo "Budget exhausted ($ELAPSED seconds elapsed)"
+              break
+            fi
+
+            # Cap curl timeout to remaining budget
+            CURL_TIMEOUT=$REMAINING
+            if [ $CURL_TIMEOUT -gt 5400 ]; then
+              CURL_TIMEOUT=5400
+            fi
+
+            echo "=== Attempt $ATTEMPT/$MAX_ATTEMPTS (${REMAINING}s remaining, curl timeout ${CURL_TIMEOUT}s) ==="
+            rm -f "$ARCHIVE" "$HEADERS" "$METRICS"
+
+            set +e
+            curl \
+              --location \
+              --max-redirs 10 \
+              --proto '=https' \
+              --proto-redir '=https' \
+              --show-error \
+              --connect-timeout 30 \
+              --max-time "$CURL_TIMEOUT" \
+              --speed-limit 1024 \
+              --speed-time 300 \
+              --dump-header "$HEADERS" \
+              --output "$ARCHIVE" \
+              --write-out 'HTTP_CODE=%{http_code}\nURL_EFFECTIVE=%{url_effective}\nSIZE=%{size_download}\nSPEED=%{speed_download}\nTIME=%{time_total}\nCONTENT_TYPE=%{content_type}\n' \
+              "$FIRMWARE_URL" > "$METRICS" 2>/dev/null
+            CURL_EXIT=$?
+            set -uo pipefail
+
+            FINAL_EXIT=$CURL_EXIT
+
+            # Safe metrics extraction (no set -e crash)
+            FINAL_HTTP=$(grep '^HTTP_CODE=' "$METRICS" 2>/dev/null | cut -d= -f2 || echo "000")
+            if [ -z "$FINAL_HTTP" ]; then FINAL_HTTP="000"; fi
+
+            echo "curl exit=$CURL_EXIT, HTTP=$FINAL_HTTP"
+
+            # Non-retryable curl exits first (FR-6)
+            case $CURL_EXIT in
+              23|60)
+                echo "Non-retryable curl error $CURL_EXIT"
+                break
+                ;;
+            esac
+
+            # Success
+            if [ $CURL_EXIT -eq 0 ] && [ "$FINAL_HTTP" = "200" ]; then
+              break
+            fi
+
+            # 429: honor Retry-After
+            if [ "$FINAL_HTTP" = "429" ]; then
+              HAD_429=true
+              RETRY_AFTER=30
+              RA=$(grep -i '^Retry-After:' "$HEADERS" 2>/dev/null | tail -1 | tr -d '\r' | awk '{print $2}' || true)
+              if [ -n "$RA" ] && echo "$RA" | grep -qE '^[0-9]+$'; then
+                RETRY_AFTER=$RA
+                [ "$RETRY_AFTER" -gt 300 ] && RETRY_AFTER=300
+                [ "$RETRY_AFTER" -lt 1 ] && RETRY_AFTER=30
+              fi
+              if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+                echo "Rate limited (429). Waiting ${RETRY_AFTER}s..."
+                sleep "$RETRY_AFTER"
+              fi
+              continue
+            fi
+
+            # Non-retryable HTTP codes
+            if [ "$CURL_EXIT" -eq 0 ] && ! is_retryable_http "$FINAL_HTTP"; then
+              echo "Non-retryable HTTP $FINAL_HTTP"
+              break
+            fi
+
+            # Check if curl exit is retryable
+            if [ "$CURL_EXIT" -ne 0 ] && ! is_retryable_curl "$CURL_EXIT"; then
+              echo "Non-retryable curl exit $CURL_EXIT"
+              break
+            fi
+
+            # Retryable: backoff (skip sleep on last attempt)
+            if [ $ATTEMPT -lt $MAX_ATTEMPTS ]; then
+              if [ $ATTEMPT -eq 1 ]; then
+                DELAY=30
+              else
+                DELAY=120
+              fi
+              # Cap delay to remaining budget
+              ELAPSED_NOW=$(($(date +%s) - START_EPOCH))
+              REMAIN_NOW=$((TOTAL_BUDGET - ELAPSED_NOW))
+              if [ $DELAY -gt $REMAIN_NOW ]; then DELAY=$REMAIN_NOW; fi
+              if [ $DELAY -gt 0 ]; then
+                echo "Retrying in ${DELAY}s..."
+                sleep "$DELAY"
+              fi
+            fi
+          done
+
+          # Export results
+          DL_SIZE=$(grep '^SIZE=' "$METRICS" 2>/dev/null | cut -d= -f2 || echo "0")
+          DL_SPEED=$(grep '^SPEED=' "$METRICS" 2>/dev/null | cut -d= -f2 || echo "0")
+          DL_TIME=$(grep '^TIME=' "$METRICS" 2>/dev/null | cut -d= -f2 || echo "0")
+          DL_CONTENT_TYPE=$(grep '^CONTENT_TYPE=' "$METRICS" 2>/dev/null | cut -d= -f2 || echo "")
+          [ -z "$DL_SIZE" ] && DL_SIZE="0"
+          [ -z "$DL_SPEED" ] && DL_SPEED="0"
+          [ -z "$DL_TIME" ] && DL_TIME="0"
+
+          {
+            echo "http_code=$FINAL_HTTP"
+            echo "curl_exit=$FINAL_EXIT"
+            echo "had_429=$HAD_429"
+            echo "dl_size=$DL_SIZE"
+            echo "dl_speed=$DL_SPEED"
+            echo "dl_time=$DL_TIME"
+            echo "dl_content_type=$DL_CONTENT_TYPE"
+            echo "attempts=$ATTEMPT"
+            echo "filename=$FILENAME"
+            echo "archive=$ARCHIVE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate ZIP integrity
+        id: validate
+        if: steps.download.outputs.curl_exit == '0' && steps.download.outputs.http_code == '200'
+        env:
+          ARCHIVE_PATH: ${{ steps.download.outputs.archive }}
+        run: |
+          set -uo pipefail
+          VALID=true
+          DETAIL=""
+
+          if [ ! -s "$ARCHIVE_PATH" ]; then
+            VALID=false
+            DETAIL="File is empty or missing"
+          else
+            MAGIC=$(xxd -l 4 -p "$ARCHIVE_PATH")
+            if [ "$MAGIC" != "504b0304" ]; then
+              VALID=false
+              DETAIL="Invalid ZIP magic bytes: $MAGIC"
+            else
+              set +e
+              unzip -tqq "$ARCHIVE_PATH" > /dev/null 2>&1
+              UZ_EXIT=$?
+              set -uo pipefail
+              if [ $UZ_EXIT -ne 0 ]; then
+                VALID=false
+                DETAIL="ZIP integrity check failed (unzip exit $UZ_EXIT)"
+              else
+                DETAIL="Valid ZIP archive"
+              fi
+            fi
+          fi
+
+          echo "valid=$VALID" >> "$GITHUB_OUTPUT"
+          echo "detail=$DETAIL" >> "$GITHUB_OUTPUT"
+          echo "Integrity: $VALID ($DETAIL)"
+
+      - name: Classify result and report
+        if: always()
+        env:
+          DL_HTTP: ${{ steps.download.outputs.http_code }}
+          DL_CURL_EXIT: ${{ steps.download.outputs.curl_exit }}
+          DL_HAD_429: ${{ steps.download.outputs.had_429 }}
+          DL_SIZE: ${{ steps.download.outputs.dl_size }}
+          DL_SPEED: ${{ steps.download.outputs.dl_speed }}
+          DL_TIME: ${{ steps.download.outputs.dl_time }}
+          DL_ATTEMPTS: ${{ steps.download.outputs.attempts }}
+          DL_FILENAME: ${{ steps.download.outputs.filename }}
+          ZIP_VALID: ${{ steps.validate.outputs.valid }}
+          ZIP_DETAIL: ${{ steps.validate.outputs.detail }}
+          FIRMWARE_URL: ${{ steps.extract.outputs.url }}
+        run: |
+          set -uo pipefail
+
+          HTTP="${DL_HTTP:-}"
+          CURL_EXIT="${DL_CURL_EXIT:-}"
+          HAD_429="${DL_HAD_429:-}"
+          ATTEMPTS="${DL_ATTEMPTS:-}"
+          FILENAME="${DL_FILENAME:-}"
+
+          # Handle pre-download failures
+          if [ -n "${RESULT:-}" ]; then
+            CLASSIFICATION="$RESULT"
+            EMOJI="⚠️"
+          elif [ -z "$HTTP" ] || [ -z "$CURL_EXIT" ]; then
+            CLASSIFICATION="input_error"
+            EMOJI="⚠️"
+          elif [ "$CURL_EXIT" = "0" ] && [ "$HTTP" = "200" ] && [ "${ZIP_VALID:-}" = "true" ]; then
+            if [ "$HAD_429" = "true" ]; then
+              CLASSIFICATION="allowed_after_rate_limit"
+              EMOJI="🟡"
+            else
+              CLASSIFICATION="allowed"
+              EMOJI="🟢"
+            fi
+          elif [ "$HTTP" = "429" ]; then
+            CLASSIFICATION="rate_limited"
+            EMOJI="🟠"
+          elif [ "$HTTP" = "403" ] || [ "$HTTP" = "451" ]; then
+            CLASSIFICATION="blocked"
+            EMOJI="🔴"
+          elif [ "$HTTP" = "404" ] || [ "$HTTP" = "410" ]; then
+            CLASSIFICATION="not_found"
+            EMOJI="⚫"
+          elif echo "$HTTP" | grep -qE '^5[0-9]{2}$'; then
+            CLASSIFICATION="server_error"
+            EMOJI="🔴"
+          elif [ "$HTTP" = "000" ] || [ "$CURL_EXIT" = "6" ] || [ "$CURL_EXIT" = "7" ] || [ "$CURL_EXIT" = "28" ]; then
+            CLASSIFICATION="network_error"
+            EMOJI="🔴"
+          elif [ "$CURL_EXIT" = "23" ]; then
+            AVAIL=$(df --output=avail -B1K "$RUNNER_TEMP" 2>/dev/null | tail -1 | tr -d ' ' || echo "0")
+            if [ "$AVAIL" -lt 1048576 ] 2>/dev/null; then
+              CLASSIFICATION="disk_full"
+              EMOJI="💾"
+            else
+              CLASSIFICATION="transfer_failed"
+              EMOJI="🟠"
+            fi
+          elif [ "$HTTP" = "200" ] && [ "$CURL_EXIT" != "0" ]; then
+            CLASSIFICATION="transfer_failed"
+            EMOJI="🟠"
+          elif [ "$CURL_EXIT" = "0" ] && [ "$HTTP" = "200" ] && [ "${ZIP_VALID:-}" = "false" ]; then
+            CLASSIFICATION="integrity_failure"
+            EMOJI="🟠"
+          else
+            CLASSIFICATION="network_error"
+            EMOJI="🔴"
+          fi
+
+          # Format size
+          SIZE_MB="N/A"
+          if [ -n "${DL_SIZE:-}" ] && [ "${DL_SIZE:-0}" != "0" ]; then
+            SIZE_MB=$(echo "$DL_SIZE" | awk '{printf "%.1f MB", $1/1048576}')
+          fi
+
+          # Format speed
+          SPEED_FMT="N/A"
+          if [ -n "${DL_SPEED:-}" ] && [ "${DL_SPEED:-0}" != "0" ]; then
+            SPEED_FMT=$(echo "$DL_SPEED" | awk '{printf "%.2f MB/s", $1/1048576}')
+          fi
+
+          # Format time
+          TIME_FMT="N/A"
+          if [ -n "${DL_TIME:-}" ] && [ "${DL_TIME:-0}" != "0" ]; then
+            TIME_FMT=$(echo "$DL_TIME" | awk '{m=int($1/60); s=$1-m*60; printf "%dm %.0fs", m, s}')
+          fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY
+
+          ## $EMOJI Firmware Download Test Result
+
+          | Field | Value |
+          |-------|-------|
+          | **Status** | **$EMOJI $CLASSIFICATION** |
+          | **HTTP Code** | ${HTTP:-N/A} |
+          | **curl Exit** | ${CURL_EXIT:-N/A} |
+          | **Attempts** | ${ATTEMPTS:-N/A} |
+          | **Downloaded** | $SIZE_MB |
+          | **Speed** | $SPEED_FMT |
+          | **Duration** | $TIME_FMT |
+          | **ZIP Valid** | ${ZIP_VALID:-N/A} |
+          | **ZIP Detail** | ${ZIP_DETAIL:-N/A} |
+          | **Filename** | ${FILENAME:-N/A} |
+          | **URL** | ${FIRMWARE_URL:-N/A} |
+          | **Runner IP** | ${RUNNER_IP:-unknown} |
+
+          ### Classification Guide
+          - 🟢 **allowed**: Google served the firmware successfully
+          - 🟡 **allowed_after_rate_limit**: Initially rate-limited, succeeded on retry
+          - 🟠 **rate_limited**: Google returned 429 on all attempts
+          - 🔴 **blocked**: Google returned 403/451
+          - ⚫ **not_found**: URL returned 404/410
+          - 🔴 **server_error**: Google returned 5xx
+          - 🔴 **network_error**: Connection failed
+          - 🟠 **transfer_failed**: Download started but didn't complete
+          - 🟠 **integrity_failure**: Download completed but ZIP validation failed
+          - 💾 **disk_full**: Runner ran out of disk space
+          - ⚠️ **input_error**: FactoryImages.txt issue
+          SUMMARY
+
+          echo "::notice::Result: $CLASSIFICATION (HTTP ${HTTP:-N/A}, curl exit ${CURL_EXIT:-N/A})"
+
+          # Exit non-zero for blocks so the workflow shows as failed
+          case "$CLASSIFICATION" in
+            blocked|rate_limited|server_error|network_error)
+              echo "::warning::Google did NOT allow firmware download from this runner ($CLASSIFICATION)"
+              exit 1
+              ;;
+          esac
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/firmware.zip" "$RUNNER_TEMP/headers.txt" "$RUNNER_TEMP/metrics.txt"
+          echo "Cleanup complete"

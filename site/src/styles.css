@@ -1,0 +1,23 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:       #f8f9fa;
+  --surface:  #ffffff;
+  --border:   #dadce0;
+  --text:     #202124;
+  --muted:    #5f6368;
+  --accent:   #1a73e8;
+  --accent-h: #1558b0;
+  --radius:   8px;
+}
+
+body {
+  font-family: Roboto, "Google Sans", system-ui, sans-serif;
+  font-size: 1rem;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}

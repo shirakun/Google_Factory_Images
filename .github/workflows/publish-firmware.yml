@@ -1,0 +1,78 @@
+name: Publish Firmware Releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      device_filter:
+        description: 'Device name filter (e.g., "stallion"). Empty = all devices'
+        required: false
+        default: ''
+        type: string
+      type_filter:
+        description: 'Firmware type filter'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - factory
+          - ota
+      dry_run:
+        description: 'Dry run (report only, no downloads/uploads)'
+        required: true
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      device_filter:
+        required: false
+        default: ''
+        type: string
+      type_filter:
+        required: false
+        default: 'all'
+        type: string
+      dry_run:
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: firmware-publisher-${{ inputs.device_filter || 'all' }}-${{ inputs.type_filter || 'all' }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_PROMPT_DISABLED: '1'
+
+    steps:
+      - name: Maximize disk space
+        run: |
+          echo "=== Before cleanup ==="
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          sudo docker system prune -af 2>/dev/null || true
+          echo "=== After cleanup ==="
+          df -h /
+
+      - name: Checkout repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" .
+
+      - name: Publish firmware releases
+        env:
+          INPUT_DEVICE_FILTER: ${{ inputs.device_filter }}
+          INPUT_TYPE_FILTER: ${{ inputs.type_filter }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          chmod +x .github/scripts/publish-firmware.sh
+          .github/scripts/publish-firmware.sh

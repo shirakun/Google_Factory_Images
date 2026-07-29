@@ -1,0 +1,87 @@
+name: Update Firmware URL Lists
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: url-list-updater
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        env:
+          CHECKOUT_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
+        run: |
+          git clone "https://x-access-token:${CHECKOUT_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" .
+
+      - name: Update URL lists
+        id: scrape
+        run: |
+          chmod +x .github/scripts/update-url-lists.sh
+          .github/scripts/update-url-lists.sh
+
+      - name: Commit and push if changed
+        id: commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- FactoryImages.txt FullOTAImages.txt DriverBinaries.txt
+          if git diff --cached --quiet; then
+            echo "URL lists unchanged, nothing to commit"
+            echo "outcome=SKIPPED" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m 'chore: update firmware URL lists'
+          git push origin HEAD:master
+          echo "outcome=UPDATED" >> "$GITHUB_OUTPUT"
+
+      - name: Report outcome
+        if: always()
+        env:
+          OUTCOME: ${{ steps.commit.outputs.outcome }}
+        run: |
+          if [[ "${OUTCOME}" == "UPDATED" ]]; then
+            total=$(git diff HEAD~1 HEAD --numstat -- FactoryImages.txt FullOTAImages.txt DriverBinaries.txt 2>/dev/null | awk '{sum+=$1} END {print sum+0}')
+            echo "::notice::URL lists updated (+${total} URLs)"
+            {
+              echo "## ✅ UPDATED (+${total} URLs)"
+              echo "| File | Added | Removed |"
+              echo "|------|-------|---------|"
+              git diff HEAD~1 HEAD --numstat -- FactoryImages.txt FullOTAImages.txt DriverBinaries.txt 2>/dev/null \
+                | while IFS=$'\t' read -r added deleted file; do
+                    echo "| \`${file}\` | +${added} | -${deleted} |"
+                  done
+            } >> "$GITHUB_STEP_SUMMARY"
+          elif [[ "${OUTCOME}" == "SKIPPED" ]]; then
+            echo "## ⏭ SKIPPED" >> "$GITHUB_STEP_SUMMARY"
+            echo "URL lists are already up to date — no commit produced." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::URL list update FAILED — check prior step logs"
+            echo "## ❌ FAILED" >> "$GITHUB_STEP_SUMMARY"
+            echo "A required step exited non-zero. See the step logs above." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Keep-alive
+        if: always()
+        run: |
+          last_commit_epoch=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+          now_epoch=$(date +%s)
+          age_days=$(( (now_epoch - last_commit_epoch) / 86400 ))
+          if (( age_days > 50 )); then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            date -u > .keepalive
+            git add .keepalive
+            git commit -m 'chore: keep-alive [skip ci]'
+            git push origin HEAD:master
+          fi
