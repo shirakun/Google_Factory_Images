@@ -8,6 +8,8 @@ set -Eeuo pipefail
 readonly FACTORY_URL='https://developers.google.com/android/images'
 readonly OTA_URL='https://developers.google.com/android/ota'
 readonly DRIVERS_URL='https://developers.google.com/android/drivers'
+readonly WATCH_FACTORY_URL='https://developers.google.com/android/images-watch'
+readonly WATCH_OTA_URL='https://developers.google.com/android/ota-watch'
 
 readonly FACTORY_RE='^https://dl\.google\.com/dl/android/aosp/([a-z0-9._]+)-([A-Za-z0-9._]+)-factory-([0-9a-f]{8})\.zip$'
 readonly OTA_RE='^https://dl\.google\.com/dl/android/aosp/([a-z0-9._]+)-ota-([A-Za-z0-9._]+)-([0-9a-f]{8})\.zip$'
@@ -16,6 +18,8 @@ readonly DRIVERS_RE='^https://dl\.google\.com/dl/android/aosp/[a-z0-9_]+-[A-Za-z
 readonly MIN_FACTORY=100
 readonly MIN_OTA=100
 readonly MIN_DRIVERS=50
+readonly MIN_WATCH_FACTORY=140
+readonly MIN_WATCH_OTA=140
 
 TMPDIR=""
 
@@ -36,7 +40,7 @@ scrape() {
     --connect-timeout 20 --max-time 180 \
     --user-agent 'Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101 Firefox/102.0' \
     --header 'x-devsite-partial-request: 1' \
-    --cookie 'devsite_wall_acks=nexus-image-tos,nexus-ota-tos' \
+    --cookie 'devsite_wall_acks=nexus-image-tos,nexus-ota-tos,watch-image-tos,watch-ota-tos' \
     "$page_url" > "$raw"
 
   local grep_rc=0
@@ -86,12 +90,24 @@ main() {
   cd "$repo_root"
 
   log "Scraping factory images..."
-  scrape "$FACTORY_URL" 'https://dl\.google\.com/dl/android/aosp/[^"]+\.zip' "$TMPDIR/factory.txt" "FactoryImages"
-  validate "$TMPDIR/factory.txt" "$FACTORY_RE" "$MIN_FACTORY" "FactoryImages"
+  scrape "$FACTORY_URL" 'https://dl\.google\.com/dl/android/aosp/[^"]+\.zip' "$TMPDIR/factory_phone.txt" "FactoryImages"
+  validate "$TMPDIR/factory_phone.txt" "$FACTORY_RE" "$MIN_FACTORY" "FactoryImages"
+
+  log "Scraping watch factory images..."
+  scrape "$WATCH_FACTORY_URL" 'https://dl\.google\.com/dl/android/aosp/[^"]+\.zip' "$TMPDIR/factory_watch.txt" "WatchImages"
+  validate "$TMPDIR/factory_watch.txt" "$FACTORY_RE" "$MIN_WATCH_FACTORY" "WatchImages"
+
+  LC_ALL=C sort -u "$TMPDIR/factory_phone.txt" "$TMPDIR/factory_watch.txt" > "$TMPDIR/factory.txt"
 
   log "Scraping OTA images..."
-  scrape "$OTA_URL" 'https://dl\.google\.com/dl/android/aosp/[^"]+\.zip' "$TMPDIR/ota.txt" "FullOTAImages"
-  validate "$TMPDIR/ota.txt" "$OTA_RE" "$MIN_OTA" "FullOTAImages"
+  scrape "$OTA_URL" 'https://dl\.google\.com/dl/android/aosp/[^"]+\.zip' "$TMPDIR/ota_phone.txt" "FullOTAImages"
+  validate "$TMPDIR/ota_phone.txt" "$OTA_RE" "$MIN_OTA" "FullOTAImages"
+
+  log "Scraping watch OTA images..."
+  scrape "$WATCH_OTA_URL" 'https://dl\.google\.com/dl/android/aosp/[^"]+\.zip' "$TMPDIR/ota_watch.txt" "WatchOTAImages"
+  validate "$TMPDIR/ota_watch.txt" "$OTA_RE" "$MIN_WATCH_OTA" "WatchOTAImages"
+
+  LC_ALL=C sort -u "$TMPDIR/ota_phone.txt" "$TMPDIR/ota_watch.txt" > "$TMPDIR/ota.txt"
 
   log "Scraping driver binaries..."
   scrape "$DRIVERS_URL" 'https://dl\.google\.com/dl/android/aosp/[^"]+\.tgz' "$TMPDIR/drivers.txt" "DriverBinaries"
