@@ -2,7 +2,7 @@
 
 Automated archive of Google Pixel and Nexus firmware — factory images, full OTA updates, and driver binaries — mirrored from Google's official developer pages to GitHub Releases.
 
-A firmware browser is available at the project's Cloudflare Pages deployment.
+**[Firmware Browser →](https://google-firmware-browser.pages.dev)**
 
 ## How it works
 
