@@ -7,6 +7,8 @@ name: Build and Deploy Firmware Browser
 #      from update-url-lists.yml uses GITHUB_TOKEN and GitHub will not
 #      fire downstream workflows. workflow_dispatch is always available
 #      as a manual fallback.
+#   3. Add CLOUDFLARE_API_TOKEN secret (Cloudflare API token with Pages Edit
+#      permission) to enable automatic Cloudflare Pages deployment.
 #
 # Note: this repo uses allowed_actions=local_only, so all steps are run:.
 
@@ -89,3 +91,18 @@ jobs:
           git push --force \
             "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
             HEAD:gh-pages
+
+      - name: Rebuild Angular for Cloudflare Pages (base-href /)
+        if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+        run: cd site && npx ng build --base-href /
+
+      - name: Deploy to Cloudflare Pages
+        if: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: 3356b375fc065b5e04b0827a1c06d8f1
+        run: |
+          npx wrangler pages deploy site/dist/browser \
+            --project-name google-firmware-browser \
+            --branch main \
+            --commit-dirty=true
