@@ -1,13 +1,9 @@
 name: Build and Deploy Firmware Browser
 
 # One-time setup required:
-#   1. Settings -> Pages -> Source = "Deploy from a branch" -> gh-pages / (root)
-#   2. Add RELEASE_TOKEN secret (PAT with repo scope) so daily URL-list
-#      updates can trigger this workflow. Without it, the automated push
-#      from update-url-lists.yml uses GITHUB_TOKEN and GitHub will not
-#      fire downstream workflows. workflow_dispatch is always available
-#      as a manual fallback.
-#   3. Add CLOUDFLARE_API_TOKEN secret (Cloudflare API token with Pages Edit
+#   1. Add RELEASE_TOKEN secret (PAT with repo scope) so daily URL-list
+#      updates can trigger this workflow.
+#   2. Add CLOUDFLARE_API_TOKEN secret (Cloudflare API token with Pages Edit
 #      permission) to enable automatic Cloudflare Pages deployment.
 #
 # Note: this repo uses allowed_actions=local_only, so all steps are run:.
@@ -31,7 +27,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: pages-deploy
@@ -47,11 +43,6 @@ jobs:
         env:
           CHECKOUT_TOKEN: ${{ secrets.RELEASE_TOKEN || github.token }}
         run: |
-          if [ -n "${{ secrets.RELEASE_TOKEN }}" ]; then
-            echo "::notice::Using RELEASE_TOKEN"
-          else
-            echo "::warning::Using GITHUB_TOKEN -- auto-rebuild via update-url-lists.yml will NOT fire"
-          fi
           git clone "https://x-access-token:${CHECKOUT_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" .
 
       - name: Build data.json
@@ -70,29 +61,6 @@ jobs:
         run: cp site/data.json site/src/assets/data.json
 
       - name: Build Angular app
-        run: cd site && npx ng build --base-href /Google_Factory_Images/
-
-      - name: Assemble dist/
-        run: |
-          mkdir -p dist
-          cp -r site/dist/browser/. dist/
-          touch dist/.nojekyll
-
-      - name: Deploy to gh-pages
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          cd dist
-          git init
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "deploy: firmware browser $(date -u +%Y-%m-%dT%H:%M:%SZ) [skip ci]"
-          git push --force \
-            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-            HEAD:gh-pages
-
-      - name: Rebuild Angular for Cloudflare Pages (base-href /)
         run: cd site && npx ng build --base-href /
 
       - name: Deploy to Cloudflare Pages
@@ -104,3 +72,4 @@ jobs:
             --project-name google-firmware-browser \
             --branch master \
             --commit-dirty=true
+
