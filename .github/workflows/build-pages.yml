@@ -16,6 +16,7 @@ on:
     paths:
       - 'FactoryImages.txt'
       - 'FullOTAImages.txt'
+      - 'FirmwareMetadata.json'
       - 'site/src/**'
       - 'site/device-release-dates.json'
       - 'site/package.json'

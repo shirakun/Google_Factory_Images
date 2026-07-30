@@ -147,6 +147,15 @@ export async function fetchPartUrlMap(repo) {
   return map;
 }
 
+// Reads FirmwareMetadata.json (produced by update-url-lists.sh via scrape-metadata.mjs).
+// Returns Map<sourceUrl, { checksum: string|null, flashUrl: string|null }>.
+// Returns an empty Map when the file is absent — allows pre-sidecar builds to succeed.
+export function loadMetadata(metadataPath) {
+  if (!existsSync(metadataPath)) return new Map();
+  const raw = JSON.parse(readFileSync(metadataPath, 'utf8'));
+  return new Map(Object.entries(raw));
+}
+
 // Constructs a GitHub Release download URL from components.
 function buildGitHubReleaseUrl(repo, device, type, filename) {
   return `https://github.com/${repo}/releases/download/firmware-${device}-${type}/${filename}`;
@@ -155,17 +164,22 @@ function buildGitHubReleaseUrl(repo, device, type, filename) {
 // Builds the data.json output object from parsed entries + name map.
 // repo: GITHUB_REPOSITORY value; when set, constructs GitHub Release URLs deterministically.
 // partUrlMap: Map from fetchPartUrlMap — sharded entries get array of part+manifest URLs.
-export function buildOutput(factoryEntries, otaEntries, nameMap, meta = {}, repo = '', partUrlMap = new Map()) {
+export function buildOutput(factoryEntries, otaEntries, nameMap, meta = {}, repo = '', partUrlMap = new Map(), metadataMap = new Map()) {
   const devices = {};
 
   const makeEntry = (device, type, buildId, googleUrl) => {
-    if (!repo) return [buildId, googleUrl];
+    // Attach metadata using the original Google URL as key (before any URL rewrite).
+    const meta = metadataMap.get(googleUrl);
+    const checksum = meta?.checksum ?? null;
+    const flashUrl = meta?.flashUrl ?? null;
+
+    if (!repo) return [buildId, googleUrl, checksum, flashUrl];
     const key = `${device}:${type}:${buildId}`;
     if (partUrlMap.has(key)) {
-      return [buildId, partUrlMap.get(key)];
+      return [buildId, partUrlMap.get(key), checksum, flashUrl];
     }
     const filename = googleUrl.split('/').pop();
-    return [buildId, buildGitHubReleaseUrl(repo, device, type, filename)];
+    return [buildId, buildGitHubReleaseUrl(repo, device, type, filename), checksum, flashUrl];
   };
 
   for (const { device, buildId, url } of factoryEntries) {
@@ -200,7 +214,7 @@ export function buildOutput(factoryEntries, otaEntries, nameMap, meta = {}, repo
   const otaTotal     = Object.values(devices).reduce((s, d) => s + d.ota.length, 0);
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     generatedAt:   meta.generatedAt   ?? new Date().toISOString(),
     sourceRevision: meta.sourceRevision ?? 'local',
     counts: { devices: Object.keys(devices).length, factory: factoryTotal, ota: otaTotal },
@@ -231,9 +245,16 @@ async function main() {
 
   const repo       = process.env.GITHUB_REPOSITORY ?? '';
   const partUrlMap = await fetchPartUrlMap(repo);
+  const metadataPath = resolve(repoRoot, 'FirmwareMetadata.json');
+  const metadataMap  = loadMetadata(metadataPath);
+  if (metadataMap.size > 0) {
+    console.log(`[INFO] FirmwareMetadata.json: ${metadataMap.size} entries loaded`);
+  } else {
+    console.warn('[WARN] FirmwareMetadata.json not found — checksum and Flash data will be null');
+  }
   const output = buildOutput(factoryEntries, otaEntries, nameMap, {
     sourceRevision: process.env.GITHUB_SHA ?? 'local',
-  }, repo, partUrlMap);
+  }, repo, partUrlMap, metadataMap);
 
   // Warn for any device codename that has no release date entry.
   const releaseDatesPath = resolve(repoRoot, 'site', 'device-release-dates.json');

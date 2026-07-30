@@ -1,155 +1,106 @@
 <header>
   <div class="header-inner">
-    <h1>Google Firmware Browser</h1>
-    <p class="subtitle">
-      Factory images &amp; OTA updates for
-      @if (categoryTab() === 'phones') { Pixel and Nexus devices }
-      @else { Pixel Watch wearables }
-    </p>
+    <h1>Factory Images &amp; OTA Updates for Nexus and Pixel Devices</h1>
+    <p class="subtitle">Firmware downloads for Pixel phones, tablets, and Pixel Watch wearables</p>
   </div>
 </header>
 
 <main>
-  <div class="category-tab-bar" role="tablist" aria-label="Device categories">
-    <button
-      role="tab"
-      id="tab-phones"
-      class="category-tab-btn"
-      [class.active]="categoryTab() === 'phones'"
-      [attr.aria-selected]="categoryTab() === 'phones'"
-      aria-controls="devices-panel"
-      (click)="setCategoryTab('phones')"
-    >Phones &amp; Tablets</button>
-    <button
-      role="tab"
-      id="tab-watch"
-      class="category-tab-btn"
-      [class.active]="categoryTab() === 'watch'"
-      [attr.aria-selected]="categoryTab() === 'watch'"
-      aria-controls="devices-panel"
-      (click)="setCategoryTab('watch')"
-    >Pixel Watch</button>
-  </div>
-
-  <input
-    type="search"
-    class="search-input"
-    placeholder="Filter devices…"
-    aria-label="Filter devices"
-    [ngModel]="searchQuery()"
-    (ngModelChange)="searchQuery.set($event)"
-  />
-
-  <div
-    id="devices-panel"
-    role="tabpanel"
-    [attr.aria-labelledby]="categoryTab() === 'phones' ? 'tab-phones' : 'tab-watch'"
-  >
   @if (!data()) {
     <div class="loading" aria-live="polite">Loading firmware data…</div>
   }
 
-  @if (data() && sortedDevices().length === 0) {
-    <div class="empty-state">No devices match "<em>{{ searchQuery() }}</em>"</div>
-  }
-
   @if (data()) {
-    <div class="device-list" role="list">
+    <div class="device-sections">
       @for (item of sortedDevices(); track item[0]) {
-        <div
-          class="device-card"
-          [id]="'device-' + item[0]"
-          role="listitem"
-        >
-          <button
-            class="device-row"
-            [class.open]="expandedDevice() === item[0]"
-            (click)="toggleDevice(item[0])"
-            [attr.aria-expanded]="expandedDevice() === item[0]"
-            [attr.aria-controls]="'panel-' + item[0]"
-          >
-            <span class="device-name">{{ item[1].name }}</span>
-            <span class="device-meta">
-              <span class="device-codename">{{ item[0] }}</span>
-              <span class="chevron" aria-hidden="true">&#9660;</span>
-            </span>
-          </button>
+        <section class="device-section" [id]="item[0]">
+          <h2 class="device-heading">{{ item[1].name }}</h2>
 
-          @if (expandedDevice() === item[0]) {
-            <div class="accordion-body" [id]="'panel-' + item[0]" role="region">
-              <div class="tab-bar" role="tablist">
-                <button
-                  class="tab-btn"
-                  role="tab"
-                  [class.active]="getTab(item[0]) === 'factory'"
-                  [disabled]="item[1].factory.length === 0"
-                  [attr.aria-selected]="getTab(item[0]) === 'factory'"
-                  (click)="setTab(item[0], 'factory')"
-                >
-                  Factory images
-                  @if (item[1].factory.length > 0) {
-                    <span class="tab-count">{{ item[1].factory.length }}</span>
-                  }
-                </button>
-                <button
-                  class="tab-btn"
-                  role="tab"
-                  [class.active]="getTab(item[0]) === 'ota'"
-                  [disabled]="item[1].ota.length === 0"
-                  [attr.aria-selected]="getTab(item[0]) === 'ota'"
-                  (click)="setTab(item[0], 'ota')"
-                >
-                  OTA updates
-                  @if (item[1].ota.length > 0) {
-                    <span class="tab-count">{{ item[1].ota.length }}</span>
-                  }
-                </button>
-              </div>
-
-              <div role="tabpanel">
-                @if (getEntries(item[0]).length === 0) {
-                  <p class="empty-tab">No {{ getTab(item[0]) === 'factory' ? 'factory images' : 'OTA updates' }} available.</p>
-                }
-                @for (entry of getEntries(item[0]); track entry[0]) {
-                  <div class="version-block">
-                    <div class="version-header">
-                      <span class="version-buildid">{{ entry[0] }}</span>
-                      <button
-                        class="copy-btn"
-                        type="button"
-                        (click)="copyLinks(entry)"
-                      >{{ copyStates.get(entry[0]) ? 'Copied!' : 'Copy all links' }}</button>
-                    </div>
-                    <table class="version-table">
-                      <thead>
-                        <tr><th>File</th><th>Type</th></tr>
-                      </thead>
-                      <tbody>
-                        @if (isSharded(entry)) {
-                          @for (url of getUrls(entry); track url; let i = $index) {
-                            <tr>
-                              <td><a [href]="url" rel="noopener noreferrer">{{ getFilename(url) }}</a></td>
-                              <td>{{ getPartLabel(i, getUrls(entry)) }}</td>
-                            </tr>
-                          }
+          @if (item[1].factory.length > 0) {
+            <h3 class="firmware-subheading">Factory images</h3>
+            <div class="table-scroll">
+              <table class="version-table">
+                <caption class="sr-only">Factory images for {{ item[1].name }}</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Version</th>
+                    <th scope="col">Flash</th>
+                    <th scope="col">Download</th>
+                    <th scope="col">SHA-256 Checksum</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  @for (entry of item[1].factory; track entry[0]) {
+                    <tr>
+                      <td>{{ entry[0] }}</td>
+                      <td>
+                        @if (getFlashUrl(entry)) {
+                          <a [href]="getFlashUrl(entry)" rel="noopener noreferrer" target="_blank">Flash</a>
                         } @else {
-                          <tr>
-                            <td><a [href]="getUrls(entry)[0]" rel="noopener noreferrer">{{ getFilename(getUrls(entry)[0]) }}</a></td>
-                            <td>Download</td>
-                          </tr>
+                          <span aria-label="not available">—</span>
                         }
-                      </tbody>
-                    </table>
-                  </div>
-                }
-              </div>
+                      </td>
+                      <td>
+                        @for (url of getUrls(entry); track url; let i = $index) {
+                          <a [href]="url" rel="noopener noreferrer">{{ getFilename(url) }}</a>
+                          @if (i < getUrls(entry).length - 1) { <br> }
+                        }
+                      </td>
+                      <td>
+                        @if (getChecksum(entry)) {
+                          <span class="checksum-cell">{{ getChecksum(entry) }}</span>
+                        } @else {
+                          <span aria-label="not available">—</span>
+                        }
+                      </td>
+                    </tr>
+                  }
+                </tbody>
+              </table>
             </div>
           }
-        </div>
+
+          @if (item[1].ota.length > 0) {
+            <h3 class="firmware-subheading">OTA updates</h3>
+            <div class="table-scroll">
+              <table class="version-table">
+                <caption class="sr-only">OTA updates for {{ item[1].name }}</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">Version</th>
+                    <th scope="col">Flash</th>
+                    <th scope="col">Download</th>
+                    <th scope="col">SHA-256 Checksum</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  @for (entry of item[1].ota; track entry[0]) {
+                    <tr>
+                      <td>{{ entry[0] }}</td>
+                      <td><span aria-label="not available">—</span></td>
+                      <td>
+                        @for (url of getUrls(entry); track url; let i = $index) {
+                          <a [href]="url" rel="noopener noreferrer">{{ getFilename(url) }}</a>
+                          @if (i < getUrls(entry).length - 1) { <br> }
+                        }
+                      </td>
+                      <td>
+                        @if (getChecksum(entry)) {
+                          <span class="checksum-cell">{{ getChecksum(entry) }}</span>
+                        } @else {
+                          <span aria-label="not available">—</span>
+                        }
+                      </td>
+                    </tr>
+                  }
+                </tbody>
+              </table>
+            </div>
+          }
+        </section>
       }
     </div>
   }
-  </div>
 </main>
 
 <footer>

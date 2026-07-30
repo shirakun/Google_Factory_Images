@@ -1,7 +1,8 @@
 // .github/scripts/build-pages-data.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseDateKey, compareBuildIds, parseUrlFile, buildOutput, fetchPartUrlMap, FACTORY_RE, OTA_RE } from './build-pages-data.mjs';
+import { parseDateKey, compareBuildIds, parseUrlFile, buildOutput, fetchPartUrlMap, loadMetadata, FACTORY_RE, OTA_RE } from './build-pages-data.mjs';
+import { parseRows } from './scrape-metadata.mjs';
 
 // ── parseDateKey ─────────────────────────────────────────────────────────────
 
@@ -165,12 +166,13 @@ test('buildOutput: sharded entry uses part URL array', () => {
   ]);
   const out = buildOutput(factory, [], {}, { generatedAt: 'T', sourceRevision: 'abc' }, 'owner/repo', partMap);
   const entry = out.devices.tokay.factory[0];
-  assert.equal(entry.length, 2);
   assert.equal(entry[0], 'ad1a.240530.030');
   assert.ok(Array.isArray(entry[1]));
   assert.equal(entry[1].length, 3);
   assert.ok(entry[1][2].endsWith('.sha256'));
-  assert.equal(entry[2], undefined);
+  // metadata fields present (null when no metadata map supplied)
+  assert.equal(entry[2], null);
+  assert.equal(entry[3], null);
 });
 
 test('buildOutput: sharded array part URLs sorted numerically', () => {
@@ -189,11 +191,119 @@ test('buildOutput: sharded array part URLs sorted numerically', () => {
   assert.ok(urls[2].endsWith('.sha256'));
 });
 
-test('buildOutput: non-sharded entry has no third element', () => {
+test('buildOutput: non-sharded entry has checksum and flashUrl at indices 2 and 3', () => {
   const factory = [{ device: 'akita', buildId: 'bp3a.251105.015', url: F('akita','bp3a.251105.015') }];
   const out = buildOutput(factory, [], {}, { generatedAt: 'T', sourceRevision: 'abc' }, 'owner/repo', new Map());
   const entry = out.devices.akita.factory[0];
-  assert.equal(entry.length, 2);
+  assert.equal(entry.length, 4);
   assert.equal(typeof entry[1], 'string');
-  assert.equal(entry[2], undefined);
+  // no metadata supplied → null
+  assert.equal(entry[2], null);
+  assert.equal(entry[3], null);
+});
+
+// ── scrape-metadata: parseRows ────────────────────────────────────────────────
+
+const FACTORY_ROW_4 = `<tr id="akitabp3a.251105.015">
+  <td>16.0.0 (BP3A.251105.015, Nov 2025)</td>
+  <td><a href="https://flash.android.com/build/99999999?target=akita-user&amp;signed">Flash</a></td>
+  <td><a href="https://dl.google.com/dl/android/aosp/akita-bp3a.251105.015-factory-abcd1234.zip">Link</a></td>
+  <td>abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234</td>
+</tr>`;
+
+const FACTORY_ROW_3 = `<tr id="yakjujzo54k">
+  <td>4.1.1 (JZO54K, Jul 2012)</td>
+  <td><a href="https://dl.google.com/dl/android/aosp/yakju-jzo54k-factory-d75228cf.zip">Link</a></td>
+  <td>d75228cfd75228cfd75228cfd75228cfd75228cfd75228cfd75228cfd75228cf</td>
+</tr>`;
+
+const OTA_ROW = `<tr id="akitabp3a.251105.015">
+  <td>16.0.0 (BP3A.251105.015, Nov 2025)</td>
+  <td><a href="https://dl.google.com/dl/android/aosp/akita-ota-bp3a.251105.015-abcd1234.zip">Link</a></td>
+  <td>abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234</td>
+</tr>`;
+
+const WRAPPED_ROW = `<tr
+  id="akitabp3a.251105.015"
+  class="some-class">
+  <td>16.0.0</td>
+  <td><a
+    href="https://flash.android.com/build/77777777?target=akita-user&amp;signed"
+    rel="noopener">Flash</a></td>
+  <td><a
+    href="https://dl.google.com/dl/android/aosp/akita-bp3a.251105.015-factory-abcd1234.zip"
+    class="link">Link</a></td>
+  <td>
+    abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234
+  </td>
+</tr>`;
+
+test('parseRows: factory row with Flash extracts all three fields', () => {
+  const result = parseRows(FACTORY_ROW_4);
+  const url = 'https://dl.google.com/dl/android/aosp/akita-bp3a.251105.015-factory-abcd1234.zip';
+  assert.ok(result[url]);
+  assert.equal(result[url].checksum, 'abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234');
+  assert.ok(result[url].flashUrl.startsWith('https://flash.android.com/build/99999999'));
+});
+
+test('parseRows: factory row without Flash has null flashUrl', () => {
+  const result = parseRows(FACTORY_ROW_3);
+  const url = 'https://dl.google.com/dl/android/aosp/yakju-jzo54k-factory-d75228cf.zip';
+  assert.ok(result[url]);
+  assert.ok(result[url].checksum !== null);
+  assert.equal(result[url].flashUrl, null);
+});
+
+test('parseRows: OTA row has no flashUrl', () => {
+  const result = parseRows(OTA_ROW);
+  const url = 'https://dl.google.com/dl/android/aosp/akita-ota-bp3a.251105.015-abcd1234.zip';
+  assert.ok(result[url]);
+  assert.equal(result[url].flashUrl, null);
+  assert.ok(result[url].checksum !== null);
+});
+
+test('parseRows: wrapped attributes/whitespace produce same result', () => {
+  const result = parseRows(WRAPPED_ROW);
+  const url = 'https://dl.google.com/dl/android/aosp/akita-bp3a.251105.015-factory-abcd1234.zip';
+  assert.ok(result[url]);
+  assert.ok(result[url].flashUrl.startsWith('https://flash.android.com/build/77777777'));
+  assert.equal(result[url].checksum, 'abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234');
+});
+
+test('parseRows: row without firmware URL produces no entry', () => {
+  const html = '<tr><td>Header row</td><td>No download</td></tr>';
+  const result = parseRows(html);
+  assert.equal(Object.keys(result).length, 0);
+});
+
+// ── buildOutput: metadata enrichment ─────────────────────────────────────────
+
+test('buildOutput: attaches checksum and flashUrl from metadata map', () => {
+  const googleUrl = F('akita', 'bp3a.251105.015');
+  const factory = [{ device: 'akita', buildId: 'bp3a.251105.015', url: googleUrl }];
+  const metaMap = new Map([[googleUrl, {
+    checksum: 'abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234',
+    flashUrl: 'https://flash.android.com/build/12345678?target=akita-user&signed',
+  }]]);
+  const out = buildOutput(factory, [], {}, {}, '', new Map(), metaMap);
+  const entry = out.devices.akita.factory[0];
+  assert.equal(entry[2], 'abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234');
+  assert.ok(entry[3].startsWith('https://flash.android.com/build/12345678'));
+});
+
+test('buildOutput: missing metadata produces null fields', () => {
+  const factory = [{ device: 'akita', buildId: 'bp3a.251105.015', url: F('akita','bp3a.251105.015') }];
+  const out = buildOutput(factory, [], {}, {}, '', new Map(), new Map());
+  const entry = out.devices.akita.factory[0];
+  assert.equal(entry[2], null);
+  assert.equal(entry[3], null);
+});
+
+test('buildOutput: omitting metadataMap parameter defaults to empty (backward compat)', () => {
+  const factory = [{ device: 'akita', buildId: 'bp3a.251105.015', url: F('akita','bp3a.251105.015') }];
+  const out = buildOutput(factory, [], {}, {}, '', new Map());
+  const entry = out.devices.akita.factory[0];
+  assert.equal(entry.length, 4);
+  assert.equal(entry[2], null);
+  assert.equal(entry[3], null);
 });

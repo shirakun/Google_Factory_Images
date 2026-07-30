@@ -117,6 +117,25 @@ main() {
   atomic_replace "$TMPDIR/ota.txt" "FullOTAImages.txt"
   atomic_replace "$TMPDIR/drivers.txt" "DriverBinaries.txt"
 
+  log "Building firmware metadata sidecar..."
+  node --input-type=module <<NODEEOF
+import { parseRows } from './.github/scripts/scrape-metadata.mjs';
+import { readFileSync, writeFileSync } from 'node:fs';
+const labels = ['FactoryImages', 'WatchImages', 'FullOTAImages', 'WatchOTAImages'];
+const merged = {};
+for (const label of labels) {
+  try {
+    const html = readFileSync('$TMPDIR/raw_' + label + '.html', 'utf8');
+    Object.assign(merged, parseRows(html));
+  } catch (e) {
+    process.stderr.write('[WARN] metadata scrape skipped for ' + label + ': ' + e.message + '\\n');
+  }
+}
+writeFileSync('$TMPDIR/FirmwareMetadata.json', JSON.stringify(merged));
+process.stderr.write('[INFO] FirmwareMetadata.json: ' + Object.keys(merged).length + ' entries\\n');
+NODEEOF
+  atomic_replace "$TMPDIR/FirmwareMetadata.json" "FirmwareMetadata.json"
+
   log "Done"
 }
 
