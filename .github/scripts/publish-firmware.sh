@@ -15,6 +15,7 @@ readonly RATE_LIMIT_MIN_REMAINING=100
 
 readonly FACTORY_RE='^https://dl\.google\.com/dl/android/aosp/([a-z0-9._]+)-([A-Za-z0-9._]+)-factory-([0-9a-f]{8})\.zip$'
 readonly OTA_RE='^https://dl\.google\.com/dl/android/aosp/([a-z0-9._]+)-ota-([A-Za-z0-9._]+)-([0-9a-f]{8})\.zip$'
+readonly WATCH_DEVICES_RE='^(aurora|eos|menari_btwifi|menari_lte|r11|r11btwifi|seluna|solios)$'
 
 # ─── Globals ─────────────────────────────────────────────────────────────────
 START_EPOCH=$(date +%s)
@@ -244,7 +245,13 @@ generate_notes() {
   local device="$1" ftype="$2" notes_file="$3"
 
   local source_url
-  if [[ "$ftype" == "factory" ]]; then
+  if [[ "$device" =~ $WATCH_DEVICES_RE ]]; then
+    if [[ "$ftype" == "factory" ]]; then
+      source_url="https://developers.google.com/android/images-watch"
+    else
+      source_url="https://developers.google.com/android/ota-watch"
+    fi
+  elif [[ "$ftype" == "factory" ]]; then
     source_url="https://developers.google.com/android/images"
   else
     source_url="https://developers.google.com/android/ota"
