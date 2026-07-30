@@ -1,7 +1,26 @@
-import { Component, OnInit, signal, computed } from '@angular/core';
+import { Component, OnInit, OnDestroy, signal, computed, effect, afterNextRender } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { HttpClient } from '@angular/common/http';
-import { DEVICE_RELEASE_DATES, releaseDateKey } from './device-release-dates';
+import { DEVICE_RELEASE_DATES, WATCH_CODENAMES, releaseDateKey } from './device-release-dates';
+
+// Tasks 1.1 – 1.2
+type FirmwareType = 'phone-factory' | 'phone-ota' | 'watch-factory' | 'watch-ota';
+
+interface FirmwareCategory {
+  value: FirmwareType;
+  label: string;
+  isWatch: boolean;
+  dataKey: 'factory' | 'ota';
+}
+
+const FIRMWARE_CATEGORIES: ReadonlyArray<FirmwareCategory> = [
+  { value: 'phone-factory', label: '出厂固件',    isWatch: false, dataKey: 'factory' },
+  { value: 'phone-ota',     label: 'OTA固件',     isWatch: false, dataKey: 'ota'     },
+  { value: 'watch-factory', label: '手表出厂固件', isWatch: true,  dataKey: 'factory' },
+  { value: 'watch-ota',     label: '手表OTA固件', isWatch: true,  dataKey: 'ota'     },
+];
+
+const VALID_TYPES = new Set<string>(FIRMWARE_CATEGORIES.map(c => c.value));
 
 // Schema v1 entries are length-2; schema v2 entries are length-4.
 type LegacyFwEntry   = [string, string | string[]];
@@ -22,7 +41,6 @@ interface DataJson {
   devices: Record<string, DeviceEntry>;
 }
 
-// Upgrade a legacy 2-element tuple to the canonical 4-element form.
 function normEntry(e: FwEntry): EnrichedFwEntry {
   return [e[0], e[1], (e as EnrichedFwEntry)[2] ?? null, (e as EnrichedFwEntry)[3] ?? null];
 }
@@ -32,25 +50,58 @@ function normEntry(e: FwEntry): EnrichedFwEntry {
   standalone: true,
   imports: [CommonModule],
   templateUrl: './app.component.html',
-  styleUrl: './app.component.css'
+  styleUrl: './app.component.css',
 })
-export class AppComponent implements OnInit {
-  data = signal<DataJson | null>(null);
+export class AppComponent implements OnInit, OnDestroy {
+  // Task 1.3 – expose descriptor array to template
+  readonly firmwareCategories = FIRMWARE_CATEGORIES;
 
-  sortedDevices = computed(() => {
+  // Tasks 2.1 – 2.2
+  data         = signal<DataJson | null>(null);
+  firmwareType = signal<FirmwareType>('phone-factory');
+  activeDevice = signal<string | null>(null);
+
+  // Task 2.4 – single source of truth for active category descriptor
+  private get activeCategory(): FirmwareCategory {
+    return FIRMWARE_CATEGORIES.find(c => c.value === this.firmwareType())!;
+  }
+
+  // Task 2.3 – filtered + sorted devices for active firmware type
+  filteredDevices = computed(() => {
     const d = this.data();
     if (!d) return [];
-    return Object.entries(d.devices).sort((a, b) => {
-      const da = this.releaseKey(a[0], a[1]);
-      const db = this.releaseKey(b[0], b[1]);
-      if (da !== db) return db - da;
-      return a[1].name.localeCompare(b[1].name, undefined, { numeric: true });
-    });
+    const cat = this.activeCategory;
+    return Object.entries(d.devices)
+      .filter(([codename, dev]) =>
+        WATCH_CODENAMES.has(codename) === cat.isWatch &&
+        dev[cat.dataKey].length > 0
+      )
+      .sort((a, b) => {
+        const da = this.releaseKey(a[0], a[1]);
+        const db = this.releaseKey(b[0], b[1]);
+        if (da !== db) return db - da;
+        return a[1].name.localeCompare(b[1].name, undefined, { numeric: true });
+      });
   });
 
-  constructor(private http: HttpClient) {}
+  // Task 3.2
+  private observer: IntersectionObserver | null = null;
 
+  constructor(private http: HttpClient) {
+    // Task 3.5 – rebuild observer after every filteredDevices render cycle
+    effect(() => {
+      this.filteredDevices(); // establish reactive dependency
+      afterNextRender(() => this.rebuildObserver());
+    });
+  }
+
+  // Task 2.5
   ngOnInit(): void {
+    const typeParam = new URLSearchParams(window.location.search).get('type');
+    if (typeParam && VALID_TYPES.has(typeParam)) {
+      this.firmwareType.set(typeParam as FirmwareType);
+    }
+
     this.http.get<{
       schemaVersion: number;
       generatedAt: string;
@@ -64,13 +115,30 @@ export class AppComponent implements OnInit {
           devices[code] = {
             name: dev.name,
             factory: dev.factory.map(normEntry),
-            ota: dev.ota.map(normEntry),
+            ota:     dev.ota.map(normEntry),
           };
         }
         this.data.set({ ...raw, devices });
       },
       error: () => console.error('Failed to load data.json'),
     });
+  }
+
+  // Task 3.6
+  ngOnDestroy(): void {
+    this.observer?.disconnect();
+  }
+
+  // Task 3.1
+  setFirmwareType(type: FirmwareType): void {
+    this.firmwareType.set(type);
+    history.replaceState(null, '', '?type=' + type);
+    window.scrollTo({ top: 0, behavior: 'instant' });
+  }
+
+  // Task 3.7 – single entry-point for template table rows
+  getDeviceEntries(dev: DeviceEntry): EnrichedFwEntry[] {
+    return dev[this.activeCategory.dataKey];
   }
 
   isSharded(entry: EnrichedFwEntry): boolean {
@@ -91,6 +159,35 @@ export class AppComponent implements OnInit {
 
   getFlashUrl(entry: EnrichedFwEntry): string | null {
     return entry[3];
+  }
+
+  // Task 3.3 – 3.4
+  private rebuildObserver(): void {
+    this.observer?.disconnect();
+    this.activeDevice.set(null);
+
+    const sections = Array.from(
+      document.querySelectorAll<HTMLElement>('#center-content .device-section')
+    );
+    if (sections.length === 0) return;
+
+    // Capture valid IDs at rebuild time to guard stale callbacks (Task 3.4)
+    const validIds = new Set(this.filteredDevices().map(([c]) => c));
+
+    this.observer = new IntersectionObserver(
+      entries => {
+        const visible = entries
+          .filter(e => e.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+        if (visible.length > 0) {
+          const id = visible[0].target.id;
+          if (validIds.has(id)) this.activeDevice.set(id);
+        }
+      },
+      { rootMargin: '-10% 0px -70% 0px', threshold: 0 }
+    );
+
+    sections.forEach(el => this.observer!.observe(el));
   }
 
   private releaseKey(codename: string, dev: DeviceEntry): number {

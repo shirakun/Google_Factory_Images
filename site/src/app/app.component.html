@@ -5,104 +5,123 @@
   </div>
 </header>
 
-<main>
-  @if (!data()) {
-    <div class="loading" aria-live="polite">Loading firmware data…</div>
-  }
+<div class="page-shell">
 
-  @if (data()) {
-    <div class="device-sections">
-      @for (item of sortedDevices(); track item[0]) {
+  <!-- Task 4.2 + 4.3 + 4.4 : left sidebar -->
+  <aside class="left-nav" aria-label="固件分类导航">
+    <nav>
+      @for (cat of firmwareCategories; track cat.value) {
+        <button
+          class="cat-btn"
+          [class.active]="firmwareType() === cat.value"
+          [attr.aria-pressed]="firmwareType() === cat.value"
+          (click)="setFirmwareType(cat.value)"
+        >{{ cat.label }}</button>
+      }
+    </nav>
+
+    <div class="device-list-nav" role="list">
+      @for (item of filteredDevices(); track item[0]) {
+        <a
+          class="device-link"
+          [href]="'#' + item[0]"
+          role="listitem"
+          [attr.aria-current]="activeDevice() === item[0] ? 'location' : null"
+        >{{ item[1].name }}</a>
+      }
+    </div>
+  </aside>
+
+  <!-- Task 4.2 + 4.5 + 4.6 : center content -->
+  <section class="center-content" id="center-content">
+
+    <!-- Task 4.8: mobile category selector (visible ≤768px only) -->
+    <select
+      class="mobile-cat-select"
+      [value]="firmwareType()"
+      (change)="setFirmwareType($any($event.target).value)"
+      aria-label="选择固件类型"
+    >
+      @for (cat of firmwareCategories; track cat.value) {
+        <option [value]="cat.value">{{ cat.label }}</option>
+      }
+    </select>
+
+    @if (!data()) {
+      <div class="loading" aria-live="polite">Loading firmware data…</div>
+    }
+
+    @if (data() && filteredDevices().length === 0) {
+      <div class="loading">该分类暂无固件数据。</div>
+    }
+
+    @if (data()) {
+      @for (item of filteredDevices(); track item[0]) {
         <section class="device-section" [id]="item[0]">
           <h2 class="device-heading">{{ item[1].name }}</h2>
 
-          @if (item[1].factory.length > 0) {
-            <h3 class="firmware-subheading">Factory images</h3>
-            <div class="table-scroll">
-              <table class="version-table">
-                <caption class="sr-only">Factory images for {{ item[1].name }}</caption>
-                <thead>
+          <div class="table-scroll">
+            <table class="version-table">
+              <caption class="sr-only">{{ item[1].name }} 固件列表</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Version</th>
+                  <th scope="col">Flash</th>
+                  <th scope="col">Download</th>
+                  <th scope="col">SHA-256 Checksum</th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (entry of getDeviceEntries(item[1]); track entry[0]) {
                   <tr>
-                    <th scope="col">Version</th>
-                    <th scope="col">Flash</th>
-                    <th scope="col">Download</th>
-                    <th scope="col">SHA-256 Checksum</th>
+                    <td>{{ entry[0] }}</td>
+                    <td>
+                      @if (getFlashUrl(entry)) {
+                        <a [href]="getFlashUrl(entry)" rel="noopener noreferrer" target="_blank">Flash</a>
+                      } @else {
+                        <span aria-label="not available">—</span>
+                      }
+                    </td>
+                    <td>
+                      @for (url of getUrls(entry); track url; let i = $index) {
+                        <a [href]="url" rel="noopener noreferrer">{{ getFilename(url) }}</a>
+                        @if (i < getUrls(entry).length - 1) { <br> }
+                      }
+                    </td>
+                    <td>
+                      @if (getChecksum(entry)) {
+                        <span class="checksum-cell">{{ getChecksum(entry) }}</span>
+                      } @else {
+                        <span aria-label="not available">—</span>
+                      }
+                    </td>
                   </tr>
-                </thead>
-                <tbody>
-                  @for (entry of item[1].factory; track entry[0]) {
-                    <tr>
-                      <td>{{ entry[0] }}</td>
-                      <td>
-                        @if (getFlashUrl(entry)) {
-                          <a [href]="getFlashUrl(entry)" rel="noopener noreferrer" target="_blank">Flash</a>
-                        } @else {
-                          <span aria-label="not available">—</span>
-                        }
-                      </td>
-                      <td>
-                        @for (url of getUrls(entry); track url; let i = $index) {
-                          <a [href]="url" rel="noopener noreferrer">{{ getFilename(url) }}</a>
-                          @if (i < getUrls(entry).length - 1) { <br> }
-                        }
-                      </td>
-                      <td>
-                        @if (getChecksum(entry)) {
-                          <span class="checksum-cell">{{ getChecksum(entry) }}</span>
-                        } @else {
-                          <span aria-label="not available">—</span>
-                        }
-                      </td>
-                    </tr>
-                  }
-                </tbody>
-              </table>
-            </div>
-          }
-
-          @if (item[1].ota.length > 0) {
-            <h3 class="firmware-subheading">OTA updates</h3>
-            <div class="table-scroll">
-              <table class="version-table">
-                <caption class="sr-only">OTA updates for {{ item[1].name }}</caption>
-                <thead>
-                  <tr>
-                    <th scope="col">Version</th>
-                    <th scope="col">Flash</th>
-                    <th scope="col">Download</th>
-                    <th scope="col">SHA-256 Checksum</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  @for (entry of item[1].ota; track entry[0]) {
-                    <tr>
-                      <td>{{ entry[0] }}</td>
-                      <td><span aria-label="not available">—</span></td>
-                      <td>
-                        @for (url of getUrls(entry); track url; let i = $index) {
-                          <a [href]="url" rel="noopener noreferrer">{{ getFilename(url) }}</a>
-                          @if (i < getUrls(entry).length - 1) { <br> }
-                        }
-                      </td>
-                      <td>
-                        @if (getChecksum(entry)) {
-                          <span class="checksum-cell">{{ getChecksum(entry) }}</span>
-                        } @else {
-                          <span aria-label="not available">—</span>
-                        }
-                      </td>
-                    </tr>
-                  }
-                </tbody>
-              </table>
-            </div>
-          }
+                }
+              </tbody>
+            </table>
+          </div>
         </section>
       }
-    </div>
-  }
-</main>
+    }
+  </section>
 
+  <!-- Task 4.2 + 4.7: right TOC -->
+  <aside class="right-toc" aria-label="本页内容">
+    <p class="toc-title">本页内容</p>
+    <nav>
+      @for (item of filteredDevices(); track item[0]) {
+        <a
+          class="toc-link"
+          [href]="'#' + item[0]"
+          [attr.aria-current]="activeDevice() === item[0] ? 'location' : null"
+        >{{ item[1].name }}</a>
+      }
+    </nav>
+  </aside>
+
+</div>
+
+<!-- Task 4.9: footer outside page-shell -->
 <footer>
   @if (data()) {
     <p>{{ data()!.counts.devices }} devices &middot; {{ data()!.counts.factory }} factory &middot; {{ data()!.counts.ota }} OTA &middot; Updated {{ data()!.generatedAt | date:'medium' }}</p>

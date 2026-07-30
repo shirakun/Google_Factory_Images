@@ -22,12 +22,30 @@ header h1 {
   margin-top: 0.25rem;
 }
 
-main {
-  flex: 1;
-  width: 100%;
-  max-width: 960px;
+/* Task 5.2 — 3-column page shell */
+.page-shell {
+  display: grid;
+  grid-template-columns: clamp(12rem, 18vw, 16rem) minmax(0, 1fr) clamp(10rem, 14vw, 14rem);
+  gap: 0 1.5rem;
+  max-width: 1400px;
   margin: 0 auto;
   padding: 1.5rem 1rem;
+  align-items: start;
+}
+
+/* Task 5.3 — sticky sidebars */
+.left-nav,
+.right-toc {
+  position: sticky;
+  top: 4rem;
+  align-self: start;
+  max-height: calc(100dvh - 5rem);
+  overflow-y: auto;
+}
+
+/* Task 5.4 — center column must not overflow grid */
+.center-content {
+  min-width: 0;
 }
 
 footer {
@@ -48,15 +66,98 @@ footer p + p { margin-top: 0.25rem; }
   text-align: center;
 }
 
-.device-sections {
-  display: flex;
-  flex-direction: column;
+/* Task 5.5 — category buttons */
+.cat-btn {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  background: none;
+  border: none;
+  border-left: 3px solid transparent;
+  font-family: inherit;
+  font-size: 0.9rem;
+  color: var(--muted);
+  cursor: pointer;
+  transition: color 120ms ease, border-color 120ms ease;
 }
+
+.cat-btn:hover { color: var(--text); }
+
+/* Task 5.6 — active category */
+.cat-btn.active {
+  color: var(--accent);
+  border-left-color: var(--accent);
+  font-weight: 500;
+}
+
+.cat-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Task 5.7 — device anchor links in left sidebar + right TOC */
+.device-list-nav {
+  margin-top: 0.75rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.5rem;
+}
+
+.device-link,
+.toc-link {
+  display: block;
+  padding: 0.25rem 0.75rem;
+  font-size: 0.8125rem;
+  color: var(--muted);
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: color 80ms ease;
+}
+
+.device-link:hover,
+.toc-link:hover { color: var(--text); }
+
+/* Task 5.8 — active device highlight */
+.device-link[aria-current="location"],
+.toc-link[aria-current="location"] {
+  color: var(--accent);
+  font-weight: 500;
+}
+
+/* Right TOC title */
+.toc-title {
+  font-size: 0.75rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  padding: 0 0.75rem 0.5rem;
+}
+
+/* Task 5.9 — mobile selector (hidden on desktop) */
+.mobile-cat-select {
+  display: none;
+  width: 100%;
+  margin-bottom: 1rem;
+  padding: 0.5rem;
+  font-family: inherit;
+  font-size: 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: #fff;
+  color: var(--text);
+}
+
+/* ── Device sections ─────────────────────────────────────────────── */
 
 .device-section {
   content-visibility: auto;
-  contain-intrinsic-size: auto 500px;
+  contain-intrinsic-size: auto 800px; /* Task 5.11: increased from 500px */
   margin-bottom: 2.5rem;
+  scroll-margin-top: 5rem;
 }
 
 h2.device-heading {
@@ -68,16 +169,6 @@ h2.device-heading {
   padding-top: 0.5rem;
   padding-bottom: 0.5rem;
   border-bottom: 1px solid var(--border);
-  scroll-margin-top: 80px;
-}
-
-h3.firmware-subheading {
-  font-size: 0.8125rem;
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--muted);
-  margin: 1rem 0 0.5rem;
 }
 
 .table-scroll {
@@ -136,7 +227,6 @@ h3.firmware-subheading {
   display: block;
 }
 
-/* Screen-reader only utility */
 .sr-only {
   position: absolute;
   width: 1px;
@@ -149,11 +239,20 @@ h3.firmware-subheading {
   border: 0;
 }
 
-@media (max-width: 600px) {
-  main,
-  .header-inner {
-    padding-left: 1rem;
-    padding-right: 1rem;
+/* Task 5.10 — responsive collapse */
+@media (max-width: 768px) {
+  .page-shell {
+    grid-template-columns: 1fr;
+    padding: 1rem;
+  }
+
+  .left-nav,
+  .right-toc {
+    display: none;
+  }
+
+  .mobile-cat-select {
+    display: block;
   }
 
   h2.device-heading {
