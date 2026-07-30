@@ -7,8 +7,8 @@
 
 <div class="page-shell">
 
-  <!-- Task 4.2 + 4.3 + 4.4 : left sidebar -->
-  <aside class="left-nav" aria-label="固件分类导航">
+  <!-- left sidebar: 4 category buttons only, no device list -->
+  <aside class="left-nav" aria-label="Firmware category navigation">
     <nav>
       @for (cat of firmwareCategories; track cat.value) {
         <button
@@ -19,17 +19,6 @@
         >{{ cat.label }}</button>
       }
     </nav>
-
-    <div class="device-list-nav" role="list">
-      @for (item of filteredDevices(); track item[0]) {
-        <a
-          class="device-link"
-          [href]="'#' + item[0]"
-          role="listitem"
-          [attr.aria-current]="activeDevice() === item[0] ? 'location' : null"
-        >{{ item[1].name }}</a>
-      }
-    </div>
   </aside>
 
   <!-- Task 4.2 + 4.5 + 4.6 : center content -->
@@ -105,16 +94,16 @@
     }
   </section>
 
-  <!-- Task 4.2 + 4.7: right TOC -->
-  <aside class="right-toc" aria-label="本页内容">
-    <p class="toc-title">本页内容</p>
+  <!-- right TOC: buttons to avoid stripping ?type= query param on navigation -->
+  <aside class="right-toc" aria-label="On this page">
+    <p class="toc-title">On this page</p>
     <nav>
       @for (item of filteredDevices(); track item[0]) {
-        <a
+        <button
           class="toc-link"
-          [href]="'#' + item[0]"
+          (click)="scrollToDevice(item[0])"
           [attr.aria-current]="activeDevice() === item[0] ? 'location' : null"
-        >{{ item[1].name }}</a>
+        >{{ item[1].name }}</button>
       }
     </nav>
   </aside>

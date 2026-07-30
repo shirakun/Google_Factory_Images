@@ -14,10 +14,10 @@ interface FirmwareCategory {
 }
 
 const FIRMWARE_CATEGORIES: ReadonlyArray<FirmwareCategory> = [
-  { value: 'phone-factory', label: '出厂固件',    isWatch: false, dataKey: 'factory' },
-  { value: 'phone-ota',     label: 'OTA固件',     isWatch: false, dataKey: 'ota'     },
-  { value: 'watch-factory', label: '手表出厂固件', isWatch: true,  dataKey: 'factory' },
-  { value: 'watch-ota',     label: '手表OTA固件', isWatch: true,  dataKey: 'ota'     },
+  { value: 'phone-factory', label: 'Factory Images',       isWatch: false, dataKey: 'factory' },
+  { value: 'phone-ota',     label: 'OTA Updates',          isWatch: false, dataKey: 'ota'     },
+  { value: 'watch-factory', label: 'Watch Factory Images', isWatch: true,  dataKey: 'factory' },
+  { value: 'watch-ota',     label: 'Watch OTA Updates',    isWatch: true,  dataKey: 'ota'     },
 ];
 
 const VALID_TYPES = new Set<string>(FIRMWARE_CATEGORIES.map(c => c.value));
@@ -139,6 +139,11 @@ export class AppComponent implements OnInit, OnDestroy {
     this.firmwareType.set(type);
     history.replaceState(null, '', '?type=' + type);
     window.scrollTo({ top: 0, behavior: 'instant' });
+  }
+
+  // Scroll to a device section without triggering navigation (avoids stripping ?type= from URL)
+  scrollToDevice(codename: string): void {
+    document.getElementById(codename)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
   // Task 3.7 – single entry-point for template table rows

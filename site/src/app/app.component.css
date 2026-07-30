@@ -104,24 +104,27 @@ footer p + p { margin-top: 0.25rem; }
   padding-top: 0.5rem;
 }
 
-.device-link,
 .toc-link {
   display: block;
+  width: 100%;
   padding: 0.25rem 0.75rem;
   font-size: 0.8125rem;
+  font-family: inherit;
   color: var(--muted);
   text-decoration: none;
+  text-align: left;
+  background: none;
+  border: none;
+  cursor: pointer;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   transition: color 80ms ease;
 }
 
-.device-link:hover,
 .toc-link:hover { color: var(--text); }
 
 /* Task 5.8 — active device highlight */
-.device-link[aria-current="location"],
 .toc-link[aria-current="location"] {
   color: var(--accent);
   font-weight: 500;
