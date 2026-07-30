@@ -1,25 +1,57 @@
-## Resources
+# google-factory-images-download
 
-* [Factory Images for Nexus and Pixel Devices](https://developers.google.com/android/images)
-* [Full OTA Images for Nexus and Pixel Devices](https://developers.google.com/android/ota)
-* [Driver Binaries for Nexus and Pixel Devices](https://developers.google.com/android/drivers)
+Automated archive of Google Pixel and Nexus firmware — factory images, full OTA updates, and driver binaries — mirrored from Google's official developer pages to GitHub Releases.
 
-## Firmware Browser
+A firmware browser is available at the project's Cloudflare Pages deployment.
 
-A static GitHub Pages site lets you browse firmware by device, type, and version:
+## How it works
 
-> **[Open Firmware Browser →](https://YOUR_USERNAME.github.io/YOUR_REPO/)**  
-> *(replace with your actual GitHub Pages URL after enabling Pages)*
+```
+Daily cron (03:17 UTC)
+  └─ update-url-lists.yml
+       ├─ Scrapes FactoryImages.txt / FullOTAImages.txt / DriverBinaries.txt from Google
+       └─ Pushes changes → master
+             ├─ publish-firmware-orchestrator.yml
+             │    ├─ Detects changed devices (git diff)
+             │    └─ Parallel jobs → publish-firmware.yml
+             │         └─ Download → Verify → Split (>2 GB) → Upload to Releases
+             └─ build-pages.yml
+                  └─ Build Angular app → Deploy to Cloudflare Pages
+```
 
-### Setup
+## Firmware sources
 
-1. **Enable GitHub Pages**: Settings → Pages → Source = *Deploy from a branch* → Branch: `gh-pages` / `(root)`
-2. **Add `RELEASE_TOKEN` secret**: a Personal Access Token with `repo` scope.  
-   This is required for the nightly URL-list update (`update-url-lists.yml`) to automatically
-   trigger a site rebuild. Without it, pushes from that workflow use `GITHUB_TOKEN` and GitHub
-   will not fire downstream workflows. A manual `workflow_dispatch` on **Build and Deploy Firmware Browser**
-   is always available as a fallback.
+| Type | Source |
+|------|--------|
+| Factory Images (phones/tablets) | https://developers.google.com/android/images |
+| Full OTA Images (phones/tablets) | https://developers.google.com/android/ota |
+| Factory Images (Pixel Watch) | https://developers.google.com/android/images-watch |
+| Full OTA Images (Pixel Watch) | https://developers.google.com/android/ota-watch |
+| Driver Binaries | https://developers.google.com/android/drivers |
 
-### Rebuilding manually
+## Releases
 
-Run the **Build and Deploy Firmware Browser** workflow from the Actions tab.
+Each device/type combination has a dedicated GitHub Release:
+
+- Tag format: `firmware-{codename}-{factory|ota}`
+- Files exceeding GitHub's 2 GB asset limit are split into `.partNN` files with a `.sha256` manifest
+
+**To reassemble split files:**
+```bash
+cat <filename>.part* > <filename>
+sha256sum --check <filename>.sha256
+```
+
+## Setup
+
+Required secrets:
+
+| Secret | Purpose |
+|--------|---------|
+| `RELEASE_TOKEN` | PAT with `repo` scope — allows `update-url-lists.yml` pushes to trigger downstream workflows |
+| `CLOUDFLARE_API_TOKEN` | Cloudflare API token with Pages Edit permission |
+
+## Disclaimer
+
+All firmware files are provided by Google Inc. This repository mirrors them as-is for archival and convenience. Google and Pixel are trademarks of Google LLC.
+
