@@ -1,11 +1,36 @@
 <header>
   <div class="header-inner">
     <h1>Google Firmware Browser</h1>
-    <p class="subtitle">Factory images &amp; OTA updates for Pixel and Nexus devices</p>
+    <p class="subtitle">
+      Factory images &amp; OTA updates for
+      @if (categoryTab() === 'phones') { Pixel and Nexus devices }
+      @else { Pixel Watch wearables }
+    </p>
   </div>
 </header>
 
 <main>
+  <div class="category-tab-bar" role="tablist" aria-label="Device categories">
+    <button
+      role="tab"
+      id="tab-phones"
+      class="category-tab-btn"
+      [class.active]="categoryTab() === 'phones'"
+      [attr.aria-selected]="categoryTab() === 'phones'"
+      aria-controls="devices-panel"
+      (click)="setCategoryTab('phones')"
+    >Phones &amp; Tablets</button>
+    <button
+      role="tab"
+      id="tab-watch"
+      class="category-tab-btn"
+      [class.active]="categoryTab() === 'watch'"
+      [attr.aria-selected]="categoryTab() === 'watch'"
+      aria-controls="devices-panel"
+      (click)="setCategoryTab('watch')"
+    >Pixel Watch</button>
+  </div>
+
   <input
     type="search"
     class="search-input"
@@ -15,6 +40,11 @@
     (ngModelChange)="searchQuery.set($event)"
   />
 
+  <div
+    id="devices-panel"
+    role="tabpanel"
+    [attr.aria-labelledby]="categoryTab() === 'phones' ? 'tab-phones' : 'tab-watch'"
+  >
   @if (!data()) {
     <div class="loading" aria-live="polite">Loading firmware data…</div>
   }
@@ -119,6 +149,7 @@
       }
     </div>
   }
+  </div>
 </main>
 
 <footer>

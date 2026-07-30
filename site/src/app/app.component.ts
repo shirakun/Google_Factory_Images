@@ -2,7 +2,7 @@ import { Component, OnInit, signal, computed } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
-import { DEVICE_RELEASE_DATES, releaseDateKey } from './device-release-dates';
+import { DEVICE_RELEASE_DATES, WATCH_CODENAMES, releaseDateKey } from './device-release-dates';
 
 interface DeviceEntry {
   name: string;
@@ -11,6 +11,7 @@ interface DeviceEntry {
 }
 
 type FwEntry = [string, string | string[]];
+type CategoryTab = 'phones' | 'watch';
 
 interface DataJson {
   schemaVersion: number;
@@ -31,14 +32,17 @@ export class AppComponent implements OnInit {
   data = signal<DataJson | null>(null);
   expandedDevice = signal<string | null>(null);
   searchQuery = signal<string>('');
+  categoryTab = signal<CategoryTab>('phones');
   private deviceTabs = new Map<string, 'factory' | 'ota'>();
   copyStates = new Map<string, boolean>();
 
   sortedDevices = computed(() => {
     const d = this.data();
     if (!d) return [];
+    const category = this.categoryTab();
     const q = this.searchQuery().toLowerCase();
     return Object.entries(d.devices)
+      .filter(([codename]) => WATCH_CODENAMES.has(codename) === (category === 'watch'))
       .filter(([codename, dev]) =>
         !q || dev.name.toLowerCase().includes(q) || codename.toLowerCase().includes(q)
       )
@@ -59,6 +63,7 @@ export class AppComponent implements OnInit {
         const params = new URLSearchParams(window.location.search);
         const device = params.get('device');
         if (device && d.devices[device]) {
+          this.setCategoryTab(WATCH_CODENAMES.has(device) ? 'watch' : 'phones');
           this.expandDevice(device);
           setTimeout(() => {
             document.getElementById('device-' + device)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -67,6 +72,11 @@ export class AppComponent implements OnInit {
       },
       error: () => console.error('Failed to load data.json')
     });
+  }
+
+  setCategoryTab(tab: CategoryTab): void {
+    this.categoryTab.set(tab);
+    this.expandedDevice.set(null);
   }
 
   toggleDevice(codename: string): void {
