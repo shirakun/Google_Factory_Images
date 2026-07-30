@@ -1,4 +1,4 @@
-import { Component, OnInit, OnDestroy, signal, computed, effect, afterNextRender } from '@angular/core';
+import { Component, OnInit, OnDestroy, signal, computed, effect, afterNextRender, Injector, inject } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { HttpClient } from '@angular/common/http';
 import { DEVICE_RELEASE_DATES, WATCH_CODENAMES, releaseDateKey } from './device-release-dates';
@@ -56,6 +56,11 @@ export class AppComponent implements OnInit, OnDestroy {
   // Task 1.3 – expose descriptor array to template
   readonly firmwareCategories = FIRMWARE_CATEGORIES;
 
+  // Required to pass to afterNextRender() when called inside an effect callback
+  // (effect callbacks run reactively, outside injection context; afterNextRender
+  // calls assertInInjectionContext when options are omitted — Angular 17.3.12 core.mjs:15193)
+  private readonly injector = inject(Injector);
+
   // Tasks 2.1 – 2.2
   data         = signal<DataJson | null>(null);
   firmwareType = signal<FirmwareType>('phone-factory');
@@ -91,7 +96,7 @@ export class AppComponent implements OnInit, OnDestroy {
     // Task 3.5 – rebuild observer after every filteredDevices render cycle
     effect(() => {
       this.filteredDevices(); // establish reactive dependency
-      afterNextRender(() => this.rebuildObserver());
+      afterNextRender(() => this.rebuildObserver(), { injector: this.injector });
     });
   }
 
