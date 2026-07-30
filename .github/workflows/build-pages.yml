@@ -104,5 +104,5 @@ jobs:
         run: |
           npx wrangler pages deploy site/dist/browser \
             --project-name google-firmware-browser \
-            --branch main \
+            --branch master \
             --commit-dirty=true
